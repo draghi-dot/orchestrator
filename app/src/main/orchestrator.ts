@@ -1,9 +1,10 @@
 /** Durable five-phase audit pipeline. Worker prose is never a verdict. */
 import { cpSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Phase, Role, Run, WorkerProfile } from '../shared/domain'
-import { PHASE_ROLE, TERMINAL_RUN_STATES } from '../shared/domain'
+import type { Claim, Phase, Role, Run, WorkerProfile } from '../shared/domain'
+import { LANE_LABEL, PHASE_ROLE, RUNTIME_LABEL, TERMINAL_RUN_STATES, isHeadToHead, laneCount } from '../shared/domain'
 import { bounded } from '../shared/events'
+import { contest, foldRun, standing, standingLines } from '../shared/fold'
 import { settleClaim } from '../shared/verdict'
 import type { EvidenceStore } from './evidence'
 import type { ToolGateway } from './gateway'
@@ -32,6 +33,18 @@ export interface OrchestratorOptions {
 }
 
 class CancelledError extends Error {}
+
+interface TaskOptions {
+  role?: Role
+  purpose?: Purpose
+  finalReport?: boolean
+  lane?: number
+}
+
+/** Task ordinals stay unique within a phase when every lane runs a task in each slot. */
+const ordinal = (slot: number, lane: number, lanes: number) => slot * lanes + lane
+const contested = (c: Claim) => !c.withdrawn && (c.status === 'needs_review' || c.status === 'inconclusive')
+
 interface ActiveRun {
   runId: string
   controller: AbortController
@@ -169,24 +182,31 @@ export class Orchestrator {
       if (!this.store.getRun(run.id).appUrl) throw new Error('The build agent did not start the app, so live testing could not continue')
       return 'App started and ready for testing'
     })
+    const lanes = laneCount(run.contract)
+    const allLanes = Array.from({ length: lanes }, (_, lane) => lane)
     await this.phase(run, 'research', async () => {
-      await this.task(run, 'research', 0, 1)
-      await this.task(run, 'research', 1, 1, 'reporter', 'research', false)
+      const failures = await this.eachLane(run, allLanes, (lane) => this.task(run, 'research', ordinal(0, lane, lanes), 1, { lane }))
+      if (failures.length === lanes) throw new Error(`Neither contender finished testing: ${failures.join('; ')}`)
+      await this.task(run, 'research', ordinal(1, 0, lanes), 1, { role: 'reporter', finalReport: false })
       return `${this.store.listClaims(run.id).length} findings reported`
     })
     await this.phase(run, 'challenge', async () => {
       for (let round = 1; round <= run.contract.limits.maxRounds; round++) {
         await this.checkpoint(run.id)
         if (round > 1) {
-          const contested = this.store.listClaims(run.id).filter((c) => !c.withdrawn && ['needs_review', 'inconclusive'].includes(c.status))
-          if (!contested.length) break
+          const claims = this.store.listClaims(run.id)
+          const revising = allLanes.filter((lane) => claims.some((c) => c.lane === lane && contested(c)))
+          if (!revising.length) break
           this.store.append(run.id, null, 'round_started', { round })
-          await this.task(run, 'challenge', round * 2 - 1, round, 'researcher', 'revise')
+          await this.eachLane(run, revising, (lane) => this.task(run, 'challenge', ordinal(round * 2 - 1, lane, lanes), round, { role: 'researcher', purpose: 'revise', lane }))
         } else {
           this.store.append(run.id, null, 'round_started', { round })
         }
-        if (!this.store.listClaims(run.id).some((c) => c.status === 'candidate' && !c.withdrawn)) break
-        await this.task(run, 'challenge', round * 2, round)
+        const candidates = this.store.listClaims(run.id).filter((c) => c.status === 'candidate' && !c.withdrawn)
+        if (!candidates.length) break
+        // Head to head, each contender reviews only the other's findings.
+        const reviewing = isHeadToHead(run.contract) ? allLanes.filter((lane) => candidates.some((c) => c.lane !== lane)) : [0]
+        await this.eachLane(run, reviewing, (lane) => this.task(run, 'challenge', ordinal(round * 2, lane, lanes), round, { lane }))
         await this.verify(run, round)
       }
       for (const claim of this.store.listClaims(run.id)) {
@@ -215,7 +235,8 @@ export class Orchestrator {
     try {
       const note = await fn()
       await this.checkpoint(run.id)
-      const blocked = this.store.listTasks(run.id).filter((t) => t.phase === phase && t.status === 'blocked')
+      // Errors show up here only for head-to-head contenders, whose failures do not end the run.
+      const blocked = this.store.listTasks(run.id).filter((t) => t.phase === phase && (t.status === 'blocked' || t.status === 'error'))
       this.store.append(run.id, null, 'phase_finished', { phase, status: blocked.length ? 'blocked' : 'done', note: blocked.length ? `${note}. Worker limitations: ${blocked.map((t) => t.terminalReason).join('; ')}` : note })
     } catch (err) {
       this.store.append(run.id, null, 'phase_finished', { phase, status: err instanceof CancelledError ? 'cancelled' : 'error', note: bounded(String(err), 500) })
@@ -242,12 +263,35 @@ export class Orchestrator {
     }
   }
 
-  private async task(run: Run, phase: Phase, ordinal: number, round: number, role: Role = PHASE_ROLE[phase], purpose: Purpose = 'research', finalReport = true): Promise<void> {
+  /** Run one task per lane, in order. In a head-to-head audit a contender
+   * that fails does not stop the other one; returns the failures. */
+  private async eachLane(run: Run, lanes: number[], fn: (lane: number) => Promise<void>): Promise<string[]> {
+    const failures: string[] = []
+    for (const lane of lanes) {
+      try {
+        await fn(lane)
+      } catch (err) {
+        if (err instanceof CancelledError || !isHeadToHead(run.contract)) throw err
+        failures.push(`${LANE_LABEL[lane]} (${RUNTIME_LABEL[run.contract.contenders[lane].runtime]}): ${bounded(err instanceof Error ? err.message : String(err), 300)}`)
+      }
+    }
+    return failures
+  }
+
+  /** Who plays `role` in `lane`: a head-to-head contender is both the
+   * Researcher and the Thinker of its lane. */
+  private profileFor(run: Run, role: Role, lane: number): WorkerProfile {
+    if (isHeadToHead(run.contract) && (role === 'researcher' || role === 'thinker')) return run.contract.contenders[lane]
+    return run.contract.roster[role]
+  }
+
+  private async task(run: Run, phase: Phase, ordinal: number, round: number, options: TaskOptions = {}): Promise<void> {
+    const { role = PHASE_ROLE[phase], purpose = 'research', finalReport = true, lane = 0 } = options
     await this.checkpoint(run.id)
     const active = this.active!
-    const profile = run.contract.roster[role]
+    const profile = this.profileFor(run, role, lane)
     const runtime = this.options.runtimes(profile)
-    const lease = this.store.createTask(run.id, role, phase, ordinal, runtime.id, this.workerId)
+    const lease = this.store.createTask(run.id, role, phase, ordinal, runtime.id, this.workerId, lane)
     const controller = new AbortController()
     const signal = AbortSignal.any([controller.signal, active.controller.signal])
     const snapshot = this.store.getSnapshot(run.contract.snapshotId)
@@ -273,7 +317,8 @@ export class Orchestrator {
       prompt: assignmentPrompt({ role, mode: run.contract.mode, targetName: run.contract.targetName, snapshot,
         appUrl: current.appUrl ?? run.contract.externalUrl, codeAccess: tools.access().code,
         toolBudget: run.contract.limits.toolBudget[role], deadlineSeconds: timeout,
-        claimCount: this.store.listClaims(run.id).length, finalReport,
+        claimCount: this.store.listClaims(run.id).filter((c) => c.status === 'candidate' && !c.withdrawn && (!isHeadToHead(run.contract) || c.lane !== lane)).length, finalReport,
+        contest: isHeadToHead(run.contract) ? { lane, contenders: run.contract.contenders } : null,
       }) + `\nDebate round: ${round}. Task purpose: ${purpose}.\nAudit instructions: ${JSON.stringify(run.contract.audit)}\nApproved test accounts (names only): ${tools.accounts().join(', ') || 'none'}.`,
       deadlineSeconds: timeout,
       context: { targetName: run.contract.targetName, stack: snapshot.stack, appUrl: current.appUrl ?? run.contract.externalUrl, finalReport },
@@ -303,7 +348,10 @@ export class Orchestrator {
         this.store.revokeTask(lease.taskId, 'error', `Worker exceeded ${timeout}s deadline`)
         throw new Error(`${role} exceeded ${timeout}s deadline`)
       }
-      if (!outcome) throw new Error(`${role} worker did not finish`)
+      if (!outcome) {
+        this.store.revokeTask(lease.taskId, 'error', 'Worker did not finish')
+        throw new Error(`${role} worker did not finish`)
+      }
       this.conclude(lease, outcome, tools)
       if (outcome.kind === 'error' || outcome.kind === 'cancelled') throw new Error(`${role}: ${outcome.reason}`)
     } finally {
@@ -328,7 +376,9 @@ export class Orchestrator {
 
   private fallbackReport(run: Run): string {
     const claims = this.store.listClaims(run.id)
+    const standings = contest(foldRun(this.store.catchUp(0, run.id).events)).map(standing)
     return `# ${run.contract.targetName} QA report\n\nThe report agent did not write a report, so Baton wrote this summary from the recorded results.\n\n` +
+      (standings.length ? `## Head to head\n\n${standingLines(standings).join('\n')}\n\n## Findings\n\n` : '') +
       claims.map((c) => `- **${c.status}** — ${c.title} (${c.id}): ${c.verdictReason ?? 'No verdict'}`).join('\n') +
       '\n\n## Coverage limits\n\nThis report does not establish that untested behavior is correct.\n'
   }

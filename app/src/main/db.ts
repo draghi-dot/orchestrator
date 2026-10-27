@@ -181,6 +181,10 @@ const MIGRATIONS: string[] = [
     created_at TEXT NOT NULL
   );
   `,
+  `
+  ALTER TABLE tasks ADD COLUMN lane INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE claims ADD COLUMN lane INTEGER NOT NULL DEFAULT 0;
+  `,
 ]
 
 export function openDatabase(path: string): DatabaseSync {

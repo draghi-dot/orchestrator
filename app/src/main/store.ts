@@ -43,6 +43,7 @@ import type {
   TaskStatus,
   TestAccount,
   Verification,
+  WorkerProfile,
 } from '../shared/domain'
 import { AREA_LABEL, DEPTH_LIMITS, FOCUS_LABEL, ROLES, TERMINAL_TASK_STATUSES } from '../shared/domain'
 import { type Envelope, type EventType, validateEvent } from '../shared/events'
@@ -74,6 +75,7 @@ export interface Lease {
   taskId: string
   role: Role
   runtime: RuntimeId
+  lane: number
   workerId: string
   generation: number
 }
@@ -86,6 +88,8 @@ export interface StartRunInput {
   allowCommands: boolean
   audit: AuditConfig
   roster: RunContract['roster']
+  /** Two workers for a head-to-head audit; omit or leave empty for a normal one. */
+  contenders?: WorkerProfile[]
   initiator: string
   limits?: RunContract['limits']
 }
@@ -319,10 +323,11 @@ export class QaStore {
     if (!Array.isArray(audit.excludedPaths) || audit.excludedPaths.some((p) => typeof p !== 'string' || p.startsWith('/') || p.split(/[\\/]/).includes('..'))) throw new ConflictError('Excluded paths must stay within the project')
     if (!Array.isArray(audit.accounts) || audit.accounts.some((a) => typeof a !== 'string')) throw new ConflictError('Invalid test account selection')
     if (typeof audit.instructions !== 'string' || audit.instructions.length > 2000 || typeof audit.useKnowledge !== 'boolean') throw new ConflictError('Invalid audit instructions')
-    for (const role of ROLES) {
-      const profile = input.roster?.[role]
-      if (!profile || !['offline', 'claude', 'codex', 'omp'].includes(profile.runtime) || typeof profile.model !== 'string') throw new ConflictError(`Invalid worker for ${role}`)
-    }
+    const validProfile = (profile: WorkerProfile | undefined) => !!profile && ['offline', 'claude', 'codex', 'omp'].includes(profile.runtime) && typeof profile.model === 'string'
+    for (const role of ROLES) if (!validProfile(input.roster?.[role])) throw new ConflictError(`Invalid worker for ${role}`)
+    const contenders = input.contenders ?? []
+    if (!Array.isArray(contenders) || (contenders.length !== 0 && contenders.length !== 2) || !contenders.every(validProfile)) throw new ConflictError('A head-to-head audit needs exactly two workers')
+    if (contenders.length === 2 && contenders[0].runtime === contenders[1].runtime && contenders[0].model === contenders[1].model) throw new ConflictError('Pick two different workers for a head-to-head audit')
     const limits = input.limits ?? DEPTH_LIMITS[audit.depth]
     if (!Number.isInteger(limits.maxRounds) || limits.maxRounds < 1 || limits.maxRounds > 5 || !Number.isInteger(limits.maxClaims) || limits.maxClaims < 1 || limits.maxClaims > 100) throw new ConflictError('Invalid run limits')
     for (const role of ROLES) if (!Number.isFinite(limits.taskTimeoutSeconds[role]) || limits.taskTimeoutSeconds[role] <= 0 || limits.taskTimeoutSeconds[role] > 3600 || !Number.isInteger(limits.toolBudget[role]) || limits.toolBudget[role] < 1 || limits.toolBudget[role] > 1000) throw new ConflictError(`Invalid limits for ${role}`)
@@ -357,6 +362,7 @@ export class QaStore {
         allowCommands: input.allowCommands,
         audit: input.audit,
         roster: input.roster,
+        contenders: contenders.map((p) => ({ runtime: p.runtime, model: p.model })),
         dnaVersionId: dna.id,
         initiator: input.initiator,
         limits: input.limits ?? DEPTH_LIMITS[input.audit.depth],
@@ -378,6 +384,7 @@ export class QaStore {
         mode: contract.mode,
         audit: contract.audit,
         roster: contract.roster,
+        contenders: contract.contenders,
         initiator: input.initiator,
         dna_version: dna.version,
         snapshot_hash: snapshot.contentHash,
@@ -389,11 +396,13 @@ export class QaStore {
   }
 
   private toRun(r: Row): Run {
+    const contract = json<RunContract>(r.contract)
     return {
       id: String(r.id),
       idempotencyKey: String(r.idempotency_key),
       contractHash: String(r.contract_hash),
-      contract: json<RunContract>(r.contract),
+      // Runs created before head-to-head audits have no contenders.
+      contract: { ...contract, contenders: contract.contenders ?? [] },
       state: r.state as RunState,
       terminalReason: optStr(r.terminal_reason),
       summary: r.summary ? json<RunSummary>(r.summary) : null,
@@ -458,7 +467,7 @@ export class QaStore {
 
   // -------------------------------------------------------------------- tasks
 
-  createTask(runId: string, role: Role, phase: Phase, ordinal: number, runtime: RuntimeId, workerId: string): Lease {
+  createTask(runId: string, role: Role, phase: Phase, ordinal: number, runtime: RuntimeId, workerId: string, lane = 0): Lease {
     return this.tx(() => {
       const row = this.db
         .prepare('SELECT COALESCE(MAX(attempt_number), 0) AS n FROM tasks WHERE run_id = ? AND phase = ? AND ordinal = ?')
@@ -467,12 +476,12 @@ export class QaStore {
       const id = this.newId('task')
       this.db
         .prepare(
-          `INSERT INTO tasks (id, run_id, role, phase, ordinal, attempt_number, runtime, worker_id, owner_generation, status, started_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'running', ?)`,
+          `INSERT INTO tasks (id, run_id, role, phase, ordinal, attempt_number, runtime, lane, worker_id, owner_generation, status, started_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'running', ?)`,
         )
-        .run(id, runId, role, phase, ordinal, attemptNumber, runtime, workerId, this.now())
-      this.append(runId, id, 'task_started', { role, phase, runtime, worker_id: workerId, attempt_number: attemptNumber })
-      return { runId, taskId: id, role, runtime, workerId, generation: 1 }
+        .run(id, runId, role, phase, ordinal, attemptNumber, runtime, lane, workerId, this.now())
+      this.append(runId, id, 'task_started', { role, phase, runtime, lane, worker_id: workerId, attempt_number: attemptNumber })
+      return { runId, taskId: id, role, runtime, lane, workerId, generation: 1 }
     })
   }
 
@@ -485,6 +494,7 @@ export class QaStore {
       ordinal: Number(r.ordinal),
       attemptNumber: Number(r.attempt_number),
       runtime: r.runtime as RuntimeId,
+      lane: Number(r.lane ?? 0),
       workerId: String(r.worker_id),
       ownerGeneration: Number(r.owner_generation),
       status: r.status as TaskStatus,
@@ -622,7 +632,8 @@ export class QaStore {
   ): Claim {
     return this.tx(() => {
       this.assertOwner(lease)
-      const count = this.db.prepare('SELECT COUNT(*) AS n FROM claims WHERE run_id = ?').get(lease.runId) as Row
+      // Each head-to-head contender gets the full budget.
+      const count = this.db.prepare('SELECT COUNT(*) AS n FROM claims WHERE run_id = ? AND lane = ?').get(lease.runId, lease.lane) as Row
       if (Number(count.n) >= maxClaims) throw new ConflictError(`this run already has the maximum of ${maxClaims} findings`)
       const claim: Claim = {
         id: this.newId('claim'),
@@ -630,6 +641,7 @@ export class QaStore {
         taskId: lease.taskId,
         role: lease.role,
         runtime: lease.runtime,
+        lane: lease.lane,
         ...input,
         status: 'candidate',
         verdictReason: null,
@@ -640,9 +652,9 @@ export class QaStore {
       }
       this.db
         .prepare(
-          `INSERT INTO claims (id, run_id, task_id, role, runtime, title, detail, category, severity, severity_rationale, area, location,
+          `INSERT INTO claims (id, run_id, task_id, role, runtime, lane, title, detail, category, severity, severity_rationale, area, location,
              evidence_quote, reproduction, suggested_fix, status, round, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', 1, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', 1, ?)`,
         )
         .run(
           claim.id,
@@ -650,6 +662,7 @@ export class QaStore {
           claim.taskId,
           claim.role,
           claim.runtime,
+          claim.lane,
           claim.title,
           claim.detail,
           claim.category,
@@ -670,6 +683,7 @@ export class QaStore {
         area: claim.area,
         location: claim.location,
         has_repro: claim.reproduction !== null,
+        lane: claim.lane,
       })
       return claim
     })
@@ -714,6 +728,7 @@ export class QaStore {
       taskId: String(r.task_id),
       role: r.role as Role,
       runtime: r.runtime as RuntimeId,
+      lane: Number(r.lane ?? 0),
       title: String(r.title),
       detail: String(r.detail),
       category: r.category as Category,

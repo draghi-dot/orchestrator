@@ -185,10 +185,21 @@ export interface RunContract {
   allowCommands: boolean
   audit: AuditConfig
   roster: Roster
+  /** Empty for a normal audit. In a head-to-head audit, two workers that each
+   * research on their own lane and then review the other's findings; they
+   * replace the roster's Researcher and Thinker. */
+  contenders: WorkerProfile[]
   dnaVersionId: string
   initiator: string
   limits: RunLimits
 }
+
+export const isHeadToHead = (contract: Pick<RunContract, 'contenders'>): boolean => contract.contenders.length === 2
+
+/** Lanes in a run: one per contender, or the single lane of a normal audit. */
+export const laneCount = (contract: Pick<RunContract, 'contenders'>): number => (isHeadToHead(contract) ? 2 : 1)
+
+export const LANE_LABEL = ['A', 'B'] as const
 
 export interface RunSummary {
   claims: number
@@ -222,6 +233,8 @@ export interface Task {
   ordinal: number
   attemptNumber: number
   runtime: RuntimeId
+  /** The contender this task works for; always 0 outside head-to-head audits. */
+  lane: number
   workerId: string
   ownerGeneration: number
   status: TaskStatus
@@ -296,6 +309,8 @@ export interface Claim {
   taskId: string
   role: Role
   runtime: RuntimeId
+  /** The contender that proposed it; always 0 outside head-to-head audits. */
+  lane: number
   title: string
   detail: string
   category: Category

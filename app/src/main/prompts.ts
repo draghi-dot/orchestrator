@@ -4,8 +4,8 @@
  * from which runtime had better tools.
  */
 
-import type { Role, Snapshot, TestMode } from '../shared/domain'
-import { MODE_LABEL, ROLE_LABEL } from '../shared/domain'
+import type { Role, Snapshot, TestMode, WorkerProfile } from '../shared/domain'
+import { LANE_LABEL, MODE_LABEL, ROLE_LABEL, RUNTIME_LABEL } from '../shared/domain'
 
 const COMMON = [
   'You work inside QA DNA, an arena where AI workers test a software application and challenge each other’s findings.',
@@ -116,6 +116,8 @@ export function assignmentPrompt(input: {
   deadlineSeconds: number
   claimCount: number
   finalReport: boolean
+  /** Set in a head-to-head audit: which contender this task works for. */
+  contest?: { lane: number; contenders: WorkerProfile[] } | null
 }): string {
   const { snapshot } = input
   const lines = [`App under test: ${input.targetName}`, `Mode: ${MODE_LABEL[input.mode]}`]
@@ -131,8 +133,21 @@ export function assignmentPrompt(input: {
     lines.push(`Detected commands (hints, verify them): install ${c.install ?? 'none'}; start ${c.start ?? 'none'}; test ${c.test ?? 'none'}.`)
   }
   if (input.appUrl && input.role !== 'reporter' && input.role !== 'improver') lines.push(`The app is running. Use paths like /api/x with http_request (base ${input.appUrl}).`)
+  if (input.contest) lines.push(contestBrief(input.role, input.contest))
   if (input.role === 'thinker') lines.push(`There ${input.claimCount === 1 ? 'is 1 claim' : `are ${input.claimCount} claims`} to challenge.`)
   if (input.role === 'reporter') lines.push(input.finalReport ? 'This is the final report for the run.' : 'This is an interim report; the run is still going.')
   lines.push(`Limits: at most ${input.toolBudget} tool calls and ${Math.round(input.deadlineSeconds / 60)} minutes.`, '', 'Begin.')
   return lines.join('\n')
+}
+
+function contestBrief(role: Role, contest: { lane: number; contenders: WorkerProfile[] }): string {
+  if (role !== 'researcher' && role !== 'thinker') {
+    const [a, b] = contest.contenders.map((p) => RUNTIME_LABEL[p.runtime])
+    return `This was a head-to-head audit between contender A (${a}) and contender B (${b}).` + (role === 'reporter' ? ' After the summary, add a "## Head to head" section with each contender\'s standings from get_run_summary.' : '')
+  }
+  const me = LANE_LABEL[contest.lane]
+  const rival = `contender ${LANE_LABEL[1 - contest.lane]} (${RUNTIME_LABEL[contest.contenders[1 - contest.lane].runtime]})`
+  return role === 'thinker'
+    ? `Head-to-head audit: you are contender ${me}, and these are the findings of ${rival}. A correct ruling scores for you and a wrong one counts against you, so agree with real defects and dispute only what the evidence or the stated rules contradict.`
+    : `Head-to-head audit: you are contender ${me}. ${rival[0].toUpperCase()}${rival.slice(1)} tests the same app on its own, then each of you reviews the other's findings and the host checks every one. Findings that hold up score for you; findings that fall count against you.`
 }

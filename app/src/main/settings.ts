@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
-import type { Roster, RuntimeId, RuntimeSettings } from '../shared/domain'
+import type { Roster, RuntimeId, RuntimeSettings, WorkerProfile } from '../shared/domain'
 import { ROLES } from '../shared/domain'
 
 export const OFFLINE_ROSTER: Roster = {
@@ -33,6 +33,12 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
 const RUNTIMES: RuntimeId[] = ['claude', 'codex', 'omp', 'offline']
 const MODEL = /^[A-Za-z0-9@._:/-]{0,80}$/
 
+/** A worker choice from the renderer, or null when its runtime is unknown. */
+export function sanitizeProfile(p: Partial<WorkerProfile> | undefined): WorkerProfile | null {
+  if (!p || !RUNTIMES.includes(p.runtime as RuntimeId)) return null
+  return { runtime: p.runtime as RuntimeId, model: MODEL.test(p.model ?? '') ? (p.model ?? '').trim() : '' }
+}
+
 export function sanitizeSettings(input: Partial<RuntimeSettings>): RuntimeSettings {
   const command = (value: string | undefined, fallback: string) => {
     const v = (value ?? '').trim()
@@ -40,8 +46,8 @@ export function sanitizeSettings(input: Partial<RuntimeSettings>): RuntimeSettin
   }
   const roster = { ...DEFAULT_SETTINGS.defaultRoster }
   for (const role of ROLES) {
-    const p = input.defaultRoster?.[role]
-    if (p && RUNTIMES.includes(p.runtime)) roster[role] = { runtime: p.runtime, model: MODEL.test(p.model ?? '') ? (p.model ?? '').trim() : '' }
+    const p = sanitizeProfile(input.defaultRoster?.[role])
+    if (p) roster[role] = p
   }
   return {
     claudeCommand: command(input.claudeCommand, DEFAULT_SETTINGS.claudeCommand),

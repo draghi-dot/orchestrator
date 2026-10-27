@@ -17,7 +17,7 @@ export interface Envelope {
 }
 
 export const EVENT_SCHEMAS = {
-  run_created: ['target_name', 'mode', 'roster', 'initiator', 'dna_version', 'audit'],
+  run_created: ['target_name', 'mode', 'roster', 'contenders', 'initiator', 'dna_version', 'audit'],
   run_started: [],
   run_pause_requested: ['by'],
   run_paused: [],
@@ -28,7 +28,7 @@ export const EVENT_SCHEMAS = {
   run_failed: ['reason'],
   phase_started: ['phase'],
   phase_finished: ['phase', 'status', 'note'],
-  task_started: ['role', 'phase', 'runtime', 'worker_id', 'attempt_number'],
+  task_started: ['role', 'phase', 'runtime', 'lane', 'worker_id', 'attempt_number'],
   task_finished: ['role', 'phase', 'status', 'reason'],
   worker_heartbeat: ['worker_id'],
   agent_message: ['text'],
@@ -42,7 +42,7 @@ export const EVENT_SCHEMAS = {
   app_stopped: ['url', 'reason'],
   surface_noted: ['kind', 'name'],
   round_started: ['round'],
-  claim_proposed: ['claim_id', 'title', 'category', 'severity', 'area', 'has_repro'],
+  claim_proposed: ['claim_id', 'title', 'category', 'severity', 'area', 'has_repro', 'lane'],
   claim_revised: ['claim_id', 'action', 'round'],
   challenge_recorded: ['claim_id', 'stance', 'reasoning', 'round'],
   evidence_checked: ['claim_id', 'round', 'outcome', 'detail'],

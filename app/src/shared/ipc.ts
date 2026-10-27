@@ -1,5 +1,5 @@
 /** Typed renderer/host boundary. Query responses never contain credentials. */
-import type { AccountStatus, Artifact, AuditConfig, Challenge, Claim, ClaimReview, DnaVersion, ReportVersion, ReviewDecision, Roster, Run, RuleChange, RuntimeId, RuntimeSettings, Target, Task, TestAccount, TestMode, Verification } from './domain'
+import type { AccountStatus, Artifact, AuditConfig, Challenge, Claim, ClaimReview, DnaVersion, ReportVersion, ReviewDecision, Roster, Run, RuleChange, RuntimeId, RuntimeSettings, Target, Task, TestAccount, TestMode, Verification, WorkerProfile } from './domain'
 import type { Envelope } from './events'
 export type Result<T> = { ok: true; value: T } | { ok: false; error: { name: string; message: string } }
 export type Finding = Claim & { challenges: Challenge[]; verifications: Verification[]; review: ClaimReview | null }
@@ -42,7 +42,7 @@ export type Command =
   | { type: 'importGithub'; url: string; ref: string | null }
   | { type: 'importZip'; fileName: string; data: Uint8Array }
   | { type: 'chooseZip' }
-  | { type: 'startRun'; idempotencyKey: string; targetId: string; mode: TestMode; externalUrl: string | null; allowCommands: boolean; audit: AuditConfig; roster: Roster }
+  | { type: 'startRun'; idempotencyKey: string; targetId: string; mode: TestMode; externalUrl: string | null; allowCommands: boolean; audit: AuditConfig; roster: Roster; contenders?: WorkerProfile[] }
   | { type: 'pauseRun'; runId: string }
   | { type: 'resumeRun'; runId: string }
   | { type: 'cancelRun'; runId: string }

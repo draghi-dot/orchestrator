@@ -7,6 +7,7 @@
 
 import type { Check, Role, Reproduction } from '../../shared/domain'
 import { evaluateCheck, normalizeCode } from '../../shared/verdict'
+import { type Standing, standingLines } from '../../shared/fold'
 import type { ToolCallResult } from '../tools'
 import type { AgentRuntime, Assignment, Outcome, RuntimeContext } from './types'
 import { sleep } from './types'
@@ -327,6 +328,7 @@ export class OfflineRuntime implements AgentRuntime {
       claims: { claim_id: string; title: string; severity: string; location: string | null; status: string; verdict_reason: string | null; proposed_by: string }[]
       surface_noted: string[]
       workers: { role: Role; runtime: string; status: string; reason: string | null }[]
+      head_to_head?: Standing[]
     }
     const by = (status: string) => summary.claims.filter((c) => c.status === status)
     const confirmed = by('confirmed')
@@ -338,6 +340,7 @@ export class OfflineRuntime implements AgentRuntime {
       '## Summary',
       `${a.context.finalReport ? 'Final' : 'Interim'} report. Mode: ${summary.app.mode}. ${summary.claims.length} finding(s): ${confirmed.length} confirmed, ${rejected.length} false positive(s), ${open.length} open.`,
       '',
+      ...(summary.head_to_head ? ['## Head to head', ...standingLines(summary.head_to_head), ''] : []),
       '## Confirmed defects',
       ...(confirmed.length ? confirmed.map((c) => `- **${c.title}** (${c.severity}) at ${c.location ?? 'n/a'}, claim ${c.claim_id}`) : ['None yet.']),
       '',

@@ -11,7 +11,7 @@
  */
 
 import type { AuditConfig, ClaimStatus, EvidenceOutcome, Phase, Role, RunState, RuntimeId, Stance, TaskStatus, TestMode } from './domain'
-import { PHASES, ROLES } from './domain'
+import { LANE_LABEL, PHASES, ROLES, RUNTIME_LABEL } from './domain'
 import type { Envelope } from './events'
 import { claimTruth } from './verdict'
 
@@ -22,6 +22,8 @@ export interface TaskView {
   role: Role
   phase: Phase
   runtime: RuntimeId
+  /** Contender lane; 0 outside head-to-head audits. */
+  lane: number
   attemptNumber: number
   status: TaskStatus
   reason: string | null
@@ -39,6 +41,7 @@ export interface TaskView {
 export interface ChallengeView {
   taskId: string | null
   runtime: RuntimeId | null
+  lane: number
   round: number
   stance: Stance
   reasoning: string
@@ -58,6 +61,7 @@ export interface ClaimView {
   taskId: string | null
   role: Role | null
   runtime: RuntimeId | null
+  lane: number
   title: string
   category: string
   severity: string
@@ -103,6 +107,8 @@ export interface RunView {
   mode: TestMode | null
   audit: AuditConfig | null
   roster: Partial<Record<Role, { runtime: RuntimeId; model: string }>>
+  /** Two entries in a head-to-head audit, by lane; empty otherwise. */
+  contenders: { runtime: RuntimeId; model: string }[]
   dnaVersion: number | null
   initiator: string | null
   createdAt: string | null
@@ -135,6 +141,7 @@ export const initialRunView: RunView = Object.freeze({
   mode: null,
   audit: null,
   roster: {},
+  contenders: [],
   dnaVersion: null,
   initiator: null,
   createdAt: null,
@@ -191,6 +198,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         mode: str(p.mode) as TestMode,
         audit: (p.audit && typeof p.audit === 'object' ? p.audit : null) as AuditConfig | null,
         roster,
+        contenders: Array.isArray(p.contenders) ? (p.contenders as RunView['contenders']) : [],
         dnaVersion: Number(p.dna_version) || null,
         initiator: str(p.initiator),
         createdAt: event.ts,
@@ -243,6 +251,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         role: str(p.role) as Role,
         phase: str(p.phase) as Phase,
         runtime: str(p.runtime) as RuntimeId,
+        lane: Number(p.lane) || 0,
         attemptNumber: Number(p.attempt_number) || 1,
         status: 'running',
         reason: null,
@@ -320,6 +329,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         taskId: event.taskId,
         role: proposer?.role ?? null,
         runtime: proposer?.runtime ?? null,
+        lane: typeof p.lane === 'number' ? p.lane : (proposer?.lane ?? 0),
         title: str(p.title),
         category: str(p.category),
         severity: str(p.severity),
@@ -359,7 +369,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         ...c,
         challenges: [
           ...c.challenges,
-          { taskId: event.taskId, runtime: challenger?.runtime ?? null, round: Number(p.round) || 1, stance: str(p.stance) as Stance, reasoning: str(p.reasoning) },
+          { taskId: event.taskId, runtime: challenger?.runtime ?? null, lane: challenger?.lane ?? 0, round: Number(p.round) || 1, stance: str(p.stance) as Stance, reasoning: str(p.reasoning) },
         ],
       }))
       break
@@ -444,18 +454,23 @@ export interface ArenaMetrics {
   verificationCoverage: number | null
   /** Unsupported findings the arena stopped from reaching the report. */
   falsePositivesCaught: number
+  /** Of those, the ones a reviewer had disputed: what the challenge added. */
+  caughtByReview: number
   regressionTests: number
 }
 
 export function arenaMetrics(view: RunView): ArenaMetrics {
-  const m: ArenaMetrics = { claims: 0, confirmed: 0, rejected: 0, inconclusive: 0, needsReview: 0, candidate: 0, precision: null, verificationCoverage: null, falsePositivesCaught: 0, regressionTests: 0 }
+  const m: ArenaMetrics = { claims: 0, confirmed: 0, rejected: 0, inconclusive: 0, needsReview: 0, candidate: 0, precision: null, verificationCoverage: null, falsePositivesCaught: 0, caughtByReview: 0, regressionTests: 0 }
   let checked = 0
   for (const id of view.claimOrder) {
     const c = view.claims[id]
     m.claims += 1
     const status = effectiveStatus(c)
     if (status === 'confirmed') m.confirmed += 1
-    else if (status === 'rejected') m.rejected += 1
+    else if (status === 'rejected') {
+      m.rejected += 1
+      if (c.challenges.some((ch) => ch.stance === 'dispute')) m.caughtByReview += 1
+    }
     else if (status === 'inconclusive') m.inconclusive += 1
     else if (status === 'needs_review') m.needsReview += 1
     else m.candidate += 1
@@ -472,6 +487,7 @@ export function arenaMetrics(view: RunView): ArenaMetrics {
 export interface ScoreLine {
   runtime: RuntimeId
   role: Role
+  lane: number
   claimsMade: number
   claimsHeld: number
   claimsFell: number
@@ -484,11 +500,11 @@ export interface ScoreLine {
  * it right versus wrong once a claim is settled (by evidence or a person). */
 export function scoreboard(view: RunView): ScoreLine[] {
   const lines = new Map<string, ScoreLine>()
-  const line = (runtime: RuntimeId, role: Role) => {
-    const key = `${role}:${runtime}`
+  const line = (runtime: RuntimeId, role: Role, lane: number) => {
+    const key = `${role}:${runtime}:${lane}`
     let l = lines.get(key)
     if (!l) {
-      l = { runtime, role, claimsMade: 0, claimsHeld: 0, claimsFell: 0, challenges: 0, challengesRight: 0, challengesWrong: 0 }
+      l = { runtime, role, lane, claimsMade: 0, claimsHeld: 0, claimsFell: 0, challenges: 0, challengesRight: 0, challengesWrong: 0 }
       lines.set(key, l)
     }
     return l
@@ -497,18 +513,18 @@ export function scoreboard(view: RunView): ScoreLine[] {
     const c = view.claims[id]
     const truth = claimTruth(c.status, c.review?.decision ?? null)
     if (c.runtime && c.role) {
-      const l = line(c.runtime, c.role)
+      const l = line(c.runtime, c.role, c.lane)
       l.claimsMade += 1
       if (truth === true) l.claimsHeld += 1
       if (truth === false) l.claimsFell += 1
     }
     // Score each challenger on its latest stance for the claim.
     const latest = new Map<string, ChallengeView>()
-    for (const ch of c.challenges) if (ch.taskId) latest.set(`${ch.runtime}`, ch)
+    for (const ch of c.challenges) if (ch.taskId) latest.set(`${ch.runtime}:${ch.lane}`, ch)
     for (const ch of latest.values()) {
       if (!ch.runtime || !ch.taskId) continue
       const role = view.tasks[ch.taskId]?.role ?? 'thinker'
-      const l = line(ch.runtime, role)
+      const l = line(ch.runtime, role, ch.lane)
       l.challenges += 1
       if (truth === null || ch.stance === 'unsure') continue
       const right = (ch.stance === 'agree' && truth) || (ch.stance === 'dispute' && !truth)
@@ -517,4 +533,72 @@ export function scoreboard(view: RunView): ScoreLine[] {
     }
   }
   return [...lines.values()].sort((a, b) => ROLES.indexOf(a.role) - ROLES.indexOf(b.role))
+}
+
+export interface ContenderScore {
+  lane: number
+  runtime: RuntimeId
+  model: string
+  findings: number
+  held: number
+  fell: number
+  withdrawn: number
+  /** Not settled either way yet: needs a person, or could not be checked. */
+  open: number
+  rulings: number
+  rightCalls: number
+  wrongCalls: number
+  /** The other contender's findings this one disputed and that then fell. */
+  caught: number
+  points: number
+}
+
+/** Head-to-head standings, by lane; empty for a normal audit. A finding that
+ * holds up is worth 2 points and one that falls costs 1; a ruling on the
+ * other contender's finding is worth 1 when right and costs 1 when wrong.
+ * Withdrawn findings, open findings, and unsure rulings score nothing. */
+export function contest(view: RunView): ContenderScore[] {
+  if (view.contenders.length !== 2) return []
+  const scores: ContenderScore[] = view.contenders.map((p, lane) => ({
+    lane, runtime: p.runtime, model: p.model, findings: 0, held: 0, fell: 0, withdrawn: 0, open: 0, rulings: 0, rightCalls: 0, wrongCalls: 0, caught: 0, points: 0,
+  }))
+  for (const id of view.claimOrder) {
+    const c = view.claims[id]
+    const own = scores[c.lane]
+    if (!own) continue
+    const truth = claimTruth(c.status, c.review?.decision ?? null)
+    own.findings += 1
+    if (c.withdrawn) own.withdrawn += 1
+    else if (truth === true) own.held += 1
+    else if (truth === false) own.fell += 1
+    else own.open += 1
+    // A reviewer may rule again after a revision; its latest ruling counts.
+    const latest = new Map<number, ChallengeView>()
+    for (const ch of c.challenges) if (ch.lane !== c.lane) latest.set(ch.lane, ch)
+    for (const ch of latest.values()) {
+      const rival = scores[ch.lane]
+      if (!rival) continue
+      rival.rulings += 1
+      if (truth === null || ch.stance === 'unsure') continue
+      if ((ch.stance === 'agree') === truth) {
+        rival.rightCalls += 1
+        if (ch.stance === 'dispute') rival.caught += 1
+      } else {
+        rival.wrongCalls += 1
+      }
+    }
+  }
+  for (const s of scores) s.points = 2 * s.held - s.fell + s.rightCalls - s.wrongCalls
+  return scores
+}
+
+/** A contender's standing as workers and reports show it. */
+export type Standing = Omit<ContenderScore, 'lane' | 'runtime' | 'model'> & { contender: string; runtime: string; model: string }
+
+export const standing = ({ lane, runtime, model, ...score }: ContenderScore): Standing => ({ contender: LANE_LABEL[lane], runtime: RUNTIME_LABEL[runtime], model: model || 'default', ...score })
+
+export function standingLines(standings: Standing[]): string[] {
+  return standings.map((s) =>
+    `- **Contender ${s.contender} (${s.runtime})**: ${s.points} points. ${s.findings} finding(s): ${s.held} held up, ${s.fell} fell, ${s.withdrawn} withdrawn, ${s.open} open. ` +
+    `Rulings on the other contender: ${s.rightCalls} right, ${s.wrongCalls} wrong, ${s.caught} false positive(s) caught.`)
 }

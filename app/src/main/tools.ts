@@ -13,9 +13,10 @@
 
 import { lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { join, normalize, relative, sep } from 'node:path'
-import type { Category, CheckKind, DnaVersion, Reproduction, Role, Run, Severity, Stance } from '../shared/domain'
-import { CATEGORY_LABEL, ROLES, ROLE_LABEL, RUNTIME_LABEL } from '../shared/domain'
+import type { Category, CheckKind, DnaVersion, Reproduction, Role, Run, RuntimeId, Severity, Stance } from '../shared/domain'
+import { CATEGORY_LABEL, LANE_LABEL, ROLES, ROLE_LABEL, RUNTIME_LABEL, isHeadToHead } from '../shared/domain'
 import { bounded } from '../shared/events'
+import { contest, foldRun, standing } from '../shared/fold'
 import type { EvidenceStore } from './evidence'
 import type { KnowledgeBase } from './knowledge'
 import { CommandRefused, type ProcessManager } from './processes'
@@ -437,6 +438,7 @@ export class TaskTools {
         const reasoning = str(args.reasoning).trim()
         if (reasoning.length < 10) throw new ToolRejection('Give a concrete reason (at least a sentence)')
         const claim = store.getClaim(str(args.claim_id))
+        if (this.headToHead && claim.lane === lease.lane) throw new ToolRejection('In a head-to-head audit you rule only on the other contender’s findings')
         if (claim.status !== 'candidate') throw new ToolRejection(`That finding is already ${claim.status}; rule only on findings from list_claims`)
         const challenge = store.recordChallenge(lease, { claimId: claim.id, stance, reasoning: bounded(reasoning, 2000), round: this.round })
         return { ok: true, summary: `Recorded ${stance} on ${challenge.claimId}` }
@@ -747,7 +749,7 @@ export class TaskTools {
   private reviseClaim(args: Record<string, unknown>): ToolCallResult {
     const { store, lease } = this.deps
     const claim = store.getClaim(str(args.claim_id))
-    if (claim.taskId !== lease.taskId && !this.ownsByRole(claim.taskId)) throw new ToolRejection('You can only revise findings the Researcher proposed')
+    if (claim.taskId !== lease.taskId && !this.ownsByRole(claim.taskId)) throw new ToolRejection(this.headToHead ? 'You can only revise your own findings' : 'You can only revise findings the Researcher proposed')
     const action = str(args.action)
     if (action !== 'amend' && action !== 'withdraw') throw new ToolRejection('action must be amend or withdraw')
     if (claim.status !== 'needs_review' && claim.status !== 'inconclusive') throw new ToolRejection(`That finding is ${claim.status}; only contested findings can be revised`)
@@ -769,13 +771,23 @@ export class TaskTools {
     return { ok: true, summary: `Amended ${claim.id}; it will be checked and challenged again` }
   }
 
-  /** A revise task acts for the Researcher of the same run. */
+  /** A revise task acts for the Researcher of the same run and lane. */
   private ownsByRole(taskId: string): boolean {
     try {
-      return this.deps.store.getTask(taskId).role === this.deps.lease.role
+      const task = this.deps.store.getTask(taskId)
+      return task.role === this.deps.lease.role && task.lane === this.deps.lease.lane
     } catch {
       return false
     }
+  }
+
+  get headToHead(): boolean {
+    return isHeadToHead(this.deps.run.contract)
+  }
+
+  /** Who did something, as workers see it: the contender in a head-to-head audit. */
+  private by(role: Role, runtime: RuntimeId, lane: number): string {
+    return this.headToHead ? `Contender ${LANE_LABEL[lane]} (${RUNTIME_LABEL[runtime]})` : `${ROLE_LABEL[role]} (${RUNTIME_LABEL[runtime]})`
   }
 
   private listClaims(): ToolCallResult {
@@ -783,7 +795,7 @@ export class TaskTools {
     const all = store.listClaims(lease.runId).filter((c) => !c.withdrawn)
     if (this.purpose === 'revise') {
       const contested = all
-        .filter((c) => c.status === 'needs_review' || c.status === 'inconclusive')
+        .filter((c) => c.lane === lease.lane && (c.status === 'needs_review' || c.status === 'inconclusive'))
         .map((c) => ({
           claim_id: c.id,
           title: c.title,
@@ -793,13 +805,13 @@ export class TaskTools {
           reproduction: c.reproduction,
           status: c.status,
           why: c.verdictReason,
-          objections: store.listChallenges(c.id).map((ch) => ({ by: RUNTIME_LABEL[ch.runtime], stance: ch.stance, reasoning: ch.reasoning })),
+          objections: store.listChallenges(c.id).map((ch) => ({ by: this.challenger(ch.taskId, ch.runtime), stance: ch.stance, reasoning: ch.reasoning })),
           host_check: store.listVerifications(c.id).slice(-1)[0] ?? null,
         }))
       return { ok: true, summary: `${contested.length} contested finding${contested.length === 1 ? '' : 's'}`, data: contested }
     }
     const pending = all
-      .filter((c) => c.status === 'candidate' && c.taskId !== lease.taskId)
+      .filter((c) => c.status === 'candidate' && c.taskId !== lease.taskId && (!this.headToHead || c.lane !== lease.lane))
       .map((c) => ({
         claim_id: c.id,
         title: c.title,
@@ -810,9 +822,18 @@ export class TaskTools {
         evidence_quote: c.evidenceQuote,
         reproduction: c.reproduction,
         round: c.round,
-        proposed_by: `${ROLE_LABEL[c.role]} (${RUNTIME_LABEL[c.runtime]})`,
+        proposed_by: this.by(c.role, c.runtime, c.lane),
       }))
     return { ok: true, summary: `${pending.length} finding${pending.length === 1 ? '' : 's'} to rule on`, data: pending }
+  }
+
+  private challenger(taskId: string, runtime: RuntimeId): string {
+    try {
+      const task = this.deps.store.getTask(taskId)
+      return this.by(task.role, task.runtime, task.lane)
+    } catch {
+      return RUNTIME_LABEL[runtime]
+    }
   }
 
   runSummary(): Record<string, unknown> {
@@ -823,7 +844,10 @@ export class TaskTools {
     return {
       app: { name: run.contract.targetName, mode: run.contract.mode, url: current.appUrl ?? run.contract.externalUrl, snapshot: run.contract.snapshotHash.slice(0, 12) },
       dna_version: this.deps.dna.version,
-      workers: store.listTasks(run.id).map((t) => ({ role: t.role, runtime: t.runtime, status: t.status, reason: t.terminalReason })),
+      ...(this.headToHead ? {
+        head_to_head: contest(foldRun(events)).map(standing),
+      } : {}),
+      workers: store.listTasks(run.id).map((t) => ({ role: t.role, runtime: t.runtime, ...(this.headToHead ? { contender: LANE_LABEL[t.lane] } : {}), status: t.status, reason: t.terminalReason })),
       claims: store.listClaims(run.id).map((c) => ({
         claim_id: c.id,
         title: c.title,
@@ -839,8 +863,8 @@ export class TaskTools {
         suggested_fix: c.suggestedFix,
         reproduction: c.reproduction,
         regression_test: c.regressionTestArtifactId !== null,
-        proposed_by: `${ROLE_LABEL[c.role]} (${RUNTIME_LABEL[c.runtime]})`,
-        challenges: store.listChallenges(c.id).map((ch) => ({ by: RUNTIME_LABEL[ch.runtime], round: ch.round, stance: ch.stance, reasoning: ch.reasoning })),
+        proposed_by: this.by(c.role, c.runtime, c.lane),
+        challenges: store.listChallenges(c.id).map((ch) => ({ by: this.challenger(ch.taskId, ch.runtime), round: ch.round, stance: ch.stance, reasoning: ch.reasoning })),
         host_checks: store.listVerifications(c.id).map((v) => ({ round: v.round, outcome: v.outcome, expected: v.expected, actual: v.actual, detail: v.detail })),
         review: store.getReview(c.id),
       })),

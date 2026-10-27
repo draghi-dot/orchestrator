@@ -1,7 +1,7 @@
 /** Host API: validates operator intent and serves durable read models. */
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Claim, RuntimeId } from '../shared/domain'
+import type { Claim, Run, RuntimeId } from '../shared/domain'
 import { TERMINAL_RUN_STATES } from '../shared/domain'
 import type { Command, CommandResults, Finding, Queries, QueryName, RunDetail } from '../shared/ipc'
 import type { AccountManager } from './accounts'
@@ -9,7 +9,7 @@ import type { EvidenceStore } from './evidence'
 import { listFiles, type Importer } from './importer'
 import type { KnowledgeBase } from './knowledge'
 import type { Orchestrator } from './orchestrator'
-import { type SettingsStore, sanitizeRoster } from './settings'
+import { type SettingsStore, sanitizeProfile, sanitizeRoster } from './settings'
 import type { QaStore } from './store'
 
 export class ControlPlaneApi {
@@ -77,7 +77,8 @@ export class ControlPlaneApi {
   }
 
   private requireIdleAccount(runtime: RuntimeId): void {
-    if (this.deps.store.activeRuns().some((r) => !TERMINAL_RUN_STATES.has(r.state) && Object.values(r.contract.roster).some((p) => p.runtime === runtime))) {
+    const uses = (r: Run) => [...Object.values(r.contract.roster), ...r.contract.contenders].some((p) => p.runtime === runtime)
+    if (this.deps.store.activeRuns().some((r) => !TERMINAL_RUN_STATES.has(r.state) && uses(r))) {
       throw new Error('Finish or cancel runs using this provider before changing its sign-in')
     }
   }
@@ -99,7 +100,8 @@ export class ControlPlaneApi {
         result = { targetId: chosen ? importer.importZip(chosen.fileName, chosen.data).id : null }; break
       }
       case 'startRun': {
-        const { run, created } = orchestrator.start({ ...command, roster: sanitizeRoster(command.roster), initiator: operator })
+        const contenders = (command.contenders ?? []).map(sanitizeProfile).filter((p) => p !== null)
+        const { run, created } = orchestrator.start({ ...command, roster: sanitizeRoster(command.roster), contenders, initiator: operator })
         result = { runId: run.id, created }; break
       }
       case 'pauseRun': result = { state: orchestrator.requestPause(command.runId, operator).state }; break
