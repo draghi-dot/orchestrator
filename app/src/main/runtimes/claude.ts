@@ -99,8 +99,8 @@ export class ClaudeRuntime implements AgentRuntime {
       child.stderr.on('data', (chunk: Buffer) => {
         stderr = (stderr + chunk.toString('utf8')).slice(-8000)
       })
-      child.on('exit', (code) => {
-        if (result) return finish({ ...result, exitCode: code })
+      child.on('close', (code) => {
+        if (result) return finish(code === 0 ? { ...result, exitCode: code } : { kind: 'error', reason: `Worker exited with code ${code}`, exitCode: code })
         const first = stderr.split('\n').map((l) => l.trim()).find(Boolean)
         finish({ kind: 'error', reason: `Claude Code exited (code ${code ?? 'null'}) without a result${first ? `: ${bounded(first, 300)}` : ''}`, exitCode: code })
       })
@@ -110,6 +110,7 @@ export class ClaudeRuntime implements AgentRuntime {
         let frame: Frame
         try {
           frame = JSON.parse(line) as Frame
+          if (!frame || typeof frame !== 'object' || Array.isArray(frame)) throw new Error('Invalid protocol frame')
         } catch {
           malformed += 1
           return
@@ -132,6 +133,7 @@ export class ClaudeRuntime implements AgentRuntime {
         }
       })
 
+      child.stdin.on('error', () => {})
       child.stdin.end(a.prompt)
     })
   }

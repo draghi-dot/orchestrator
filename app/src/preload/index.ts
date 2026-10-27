@@ -1,37 +1,46 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { Envelope } from '../shared/events'
-import type { KestrelBridge, StreamWindow } from '../shared/ipc'
+import type { QaBridge, StreamWindow } from '../shared/ipc'
 
 const listeners = new Map<string, (events: Envelope[]) => void>()
 // Live events that arrive for a subscription before its id is known locally.
 const early = new Map<string, Envelope[][]>()
+let pendingSubscriptions = 0
 
 ipcRenderer.on('qa:events', (_event, subId: string, events: Envelope[]) => {
   const listener = listeners.get(subId)
   if (listener) listener(events)
-  else early.set(subId, [...(early.get(subId) ?? []), events])
+  else if (pendingSubscriptions > 0) early.set(subId, [...(early.get(subId) ?? []), events])
 })
 
-const bridge: KestrelBridge = {
+const bridge: QaBridge = {
   query: (name, args) => ipcRenderer.invoke('qa:query', name, args),
   command: (command) => ipcRenderer.invoke('qa:command', command),
   async subscribe(runId, afterSeq, onEvents) {
-    const { subId, window } = (await ipcRenderer.invoke('qa:subscribe', runId, afterSeq)) as { subId: string; window: StreamWindow }
+    pendingSubscriptions++
+    let response: { subId: string; window: StreamWindow }
+    try { response = await ipcRenderer.invoke('qa:subscribe', runId, afterSeq) }
+    finally { pendingSubscriptions-- }
+    const { subId, window } = response
     listeners.set(subId, onEvents)
     // Pushes that raced ahead of this reply were committed after the
-    // catch-up read; append them so the caller folds one ordered window.
+    // catch-up read; let the renderer buffer them until pagination finishes.
     const buffered = (early.get(subId) ?? []).flat()
     early.delete(subId)
-    const seen = new Set(window.events.map((e) => e.seq))
-    const merged = [...window.events, ...buffered.filter((e) => !seen.has(e.seq))].sort((a, b) => a.seq - b.seq)
-    return { subId, window: { ...window, events: merged } }
+    if (buffered.length) queueMicrotask(() => onEvents(buffered))
+    return { subId, window }
   },
   async unsubscribe(subId) {
     listeners.delete(subId)
     early.delete(subId)
     await ipcRenderer.invoke('qa:unsubscribe', subId)
   },
+  onLoginUpdate(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, update: import('../shared/ipc').LoginUpdate) => listener(update)
+    ipcRenderer.on('qa:login', handler)
+    return () => { ipcRenderer.removeListener('qa:login', handler) }
+  },
   platform: process.platform,
 }
 
-contextBridge.exposeInMainWorld('kestrel', bridge)
+contextBridge.exposeInMainWorld('qa', bridge)

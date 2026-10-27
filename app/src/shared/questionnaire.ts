@@ -73,7 +73,7 @@ export function buildQuestionnaire(input: QuestionnaireInput): { questions: Ques
       prompt: 'How may the workers test it?',
       options: [
         { value: 'white', label: 'Read the code only', hint: 'White box. Nothing is run.' },
-        { value: 'black', label: 'Use the running app only', hint: 'Black box. Workers never see the code.' },
+        { value: 'black', label: 'Use the running app only', hint: 'Black box. The Researcher and Thinker do not see source code.' },
         { value: 'both', label: 'Both', hint: 'Code to find suspects, the running app to prove them.' },
       ],
       visible: always,
@@ -172,7 +172,7 @@ export function buildQuestionnaire(input: QuestionnaireInput): { questions: Ques
     accounts: input.trusted ? [...input.accounts] : [],
     focus: ['correctness', 'security'],
     depth: 'balanced',
-    exclude: '',
+    exclude: stack.sensitive.join(', '),
     knowledge: input.knowledgeDocs > 0 ? 'yes' : 'no',
     instructions: '',
   }

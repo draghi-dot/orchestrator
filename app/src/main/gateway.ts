@@ -24,7 +24,7 @@ export class ToolGateway {
 
   async start(): Promise<void> {
     if (this.server) return
-    this.server = createServer((req, res) => void this.handle(req, res))
+    this.server = createServer((req, res) => { void this.handle(req, res).catch(() => { if (!res.headersSent) res.writeHead(500); res.end() }) })
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject)
       this.server!.listen(0, '127.0.0.1', () => resolve())
@@ -58,7 +58,7 @@ export class ToolGateway {
   private find(req: IncomingMessage): Registration | null {
     const header = req.headers.authorization ?? ''
     const presented = header.startsWith('Bearer ') ? header.slice(7) : ''
-    if (presented.length !== 64) return null
+    if (!/^[a-f0-9]{64}$/.test(presented)) return null
     for (const [token, reg] of this.registrations) {
       if (timingSafeEqual(Buffer.from(token), Buffer.from(presented))) return reg
     }

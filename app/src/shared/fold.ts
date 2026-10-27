@@ -15,7 +15,7 @@ import { PHASES, ROLES } from './domain'
 import type { Envelope } from './events'
 import { claimTruth } from './verdict'
 
-export type PhaseStatus = 'waiting' | 'running' | 'done' | 'skipped' | 'blocked'
+export type PhaseStatus = 'waiting' | 'running' | 'done' | 'skipped' | 'blocked' | 'error' | 'cancelled'
 
 export interface TaskView {
   taskId: string

@@ -202,21 +202,24 @@ export class ProcessManager {
     key: string,
     command: string,
     cwd: string,
-    options: { healthPath: string; readyTimeoutMs: number; signal: AbortSignal },
+    options: { healthPath: string; readyTimeoutMs: number; signal: AbortSignal; env?: Record<string, string> },
   ): Promise<{ url: string; pid: number | undefined; log: string }> {
     const { exe, args } = prepare(command)
     await this.stopApp(key)
     const port = await freePort()
     const child = spawn(exe, args, {
       cwd,
-      env: scrubbedEnv({ PORT: String(port), HOST: '127.0.0.1', HOSTNAME: '127.0.0.1', NODE_ENV: 'development' }),
+      env: scrubbedEnv({ ...options.env, PORT: String(port), HOST: '127.0.0.1', HOSTNAME: '127.0.0.1', NODE_ENV: 'development' }),
       shell: false,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    let startError: Error | null = null
+    child.on('error', (error) => { startError = error })
     const app: ManagedApp = { child, url: `http://127.0.0.1:${port}`, command, log: '' }
     const append = (chunk: Buffer) => {
       app.log = (app.log + chunk.toString('utf8')).slice(-64 * 1024)
+      for (const value of Object.values(options.env ?? {})) if (value) app.log = app.log.split(value).join('[redacted]')
     }
     child.stdout?.on('data', append)
     child.stderr?.on('data', append)
@@ -234,6 +237,7 @@ export class ProcessManager {
         await this.stopApp(key)
         throw new CommandRefused('Stopped before the app was ready')
       }
+      if (startError) { this.apps.delete(key); throw new CommandRefused(`Could not start the app: ${String(startError)}`) }
       if (child.exitCode !== null || child.signalCode !== null) {
         this.apps.delete(key)
         throw new CommandRefused(`The app exited with code ${child.exitCode ?? child.signalCode} before it answered. Last output:\n${app.log.slice(-2000)}`)

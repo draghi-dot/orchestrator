@@ -1,64 +1,100 @@
-# Kestrel QA
+# QA Arena
 
-Desktop app (Electron) for agent-run QA. Agents execute test cases; deterministic code decides pass or fail from recorded evidence; every step lands in a durable, replayable event log.
+An Electron app for evidence-driven application audits. Five worker roles build the app, investigate it, challenge findings, write a report, and propose improvements to their rules. The six screens are **Projects**, **Audit setup**, **Arena**, **Findings**, **DNA**, and **Settings**.
 
-Built from the patterns in `../kestrel-qa-reference-2026-10-27/` (run contract, state machine, event bus, one UI fold, evidence store, operator commands), renamed to QA vocabulary at the domain boundary.
+## Run locally
 
-## Run it
+Use Node 22.13+ with `node:sqlite` available (development tested with Node 25). From this directory:
 
 ```bash
-npm install
-npm run dev        # dev mode with hot reload
-npm run build && npm start   # production build
-npm test           # 34 tests: lifecycle, idempotency, replay, cancellation, policy, omp adapter
+npm ci
+npm run dev
+```
+
+For the compiled app:
+
+```bash
+npm run build
+npm start
+```
+
+Local HTTP ports must be allowed: the app uses a loopback tool gateway and starts imported test apps on loopback. Project startup scripts run on your machine; only enable commands for source you trust. This is a development app, without a signed installer or OS-level sandbox for imported build scripts.
+
+## First audit
+
+1. Open the bundled **Sample Shop** in Projects, then **Set up audit**.
+2. Choose **Use offline workers** to exercise the complete pipeline without a model account. The sample defaults to both source and HTTP testing, with the `alice` and `bob` test accounts.
+3. Start the audit. Arena shows the five phases, workers, debate rounds, host verdicts, event replay, worker scores, and artifacts.
+4. Open a finding to inspect its reproduction, source quote, challenge, verification, and generated regression test. Export the report from Arena.
+5. Review unresolved findings in Findings. Accept or reject proposed worker rules in DNA; acceptance creates a new version for future runs.
+
+The sample deliberately contains four defects: SAVE20 applies 15% instead of 20%; customers can read another customer's order; free shipping incorrectly excludes an exact $100 subtotal; negative quantities are accepted. Unknown coupons correctly return 422. The offline researcher deliberately proposes that last case as a decoy to exercise rejection. Its sample probes are deterministic fixtures, **not a measure of model discovery ability**. Sample scoring matches finding titles/descriptions against host-only ground truth.
+
+## Provider accounts and workers
+
+Settings discovers the installed `claude`, `codex`, and `omp` executables; absolute paths can also be configured. Claude and Codex offer sign-in, sign-out, status, browser links, and cancellation inside the app. They use the official CLI authentication flows; provider credentials remain under the CLI's control. Codex uses device authentication. If Claude requests a pasted authorization code, the sign-in panel accepts it. oh-my-pi authentication is managed in its own CLI.
+
+Each role has an independent runtime/model choice. Empty model fields use that CLI's default. The default lineup uses offline Builder, Codex Researcher, Claude Thinker and Reporter, and Codex Improver. Use offline workers until your providers are signed in. Changing a provider's sign-in is refused while a queued or active run uses it.
+
+Model workers operate in an empty scratch directory with native tools disabled and the QA bridge configured as their tool surface. Source, request, account, budget, and lease checks live in the host. Real provider compatibility must be validated with the installed CLI versions; protocol fixtures alone do not prove a working provider connection.
+
+## Audit behavior
+
+- **Build:** creates a working copy and starts a local app if explicitly allowed. Source-only audits and authorized test URLs skip local startup. Black-box researchers and challengers cannot read source; a local Builder still reads startup instructions.
+- **Research:** follows the frozen scope, exclusions, focus, depth, account selection, and optional library setting. Claims include category, severity reason, suggested fix, and either a replayable HTTP reproduction or a file:line quote.
+- **Challenge:** the Thinker agrees, disputes, or remains unsure. The host independently replays HTTP or checks quoted source lines. Contested findings may be amended or withdrawn in later rounds. Only the current round's challenges settle amended evidence.
+- **Report:** saves an interim report after research, then records the final outcome and coverage limits. If a blocked reporter produces no report, the host writes a factual fallback.
+- **Improve:** proposes rule additions/removals. They remain pending until you decide with a reason.
+
+Host outcomes are **confirmed**, **rejected**, **inconclusive**, or **needs review**. A successful run means orchestration finished; it does not mean the project has no bugs. Blocked tasks remain visible. Quote verification establishes that code exists at the cited location; it does not execute the code or independently prove the claimed semantics.
+
+Confirmed HTTP findings become standalone `node:test` files. The host runs them immediately and checks for a failing assertion. A passing test or an execution error sends the finding back to review. Source-only findings do not yet get executable regression tests. For exported HTTP tests, start the application and provide `APP_URL`; account-based tests additionally require the `QA_ACCOUNT_<NAME>_HEADER` and `QA_ACCOUNT_<NAME>_VALUE` environment variables named in the file. Credentials are not embedded in exports.
+
+HTTP requests stay on the selected app origin and do not follow redirects. External deployment testing accepts GET, HEAD, and OPTIONS only; writes require the local app copy. Reproductions preserve permitted request headers. This HTTP client is not a browser session: there is no browser automation, cookie jar, screenshot capture of target apps, or JavaScript-driven page testing yet.
+
+## Writeup library
+
+Set a local Markdown directory in Settings. On a fresh development installation, the app detects `../ctf-important-writeups` if present. The existing curated collection has 120 Markdown writeups plus JSON metadata; the loader uses `index.json` for attribution and searches Markdown with a local keyword index. No embedding service is required. Retrieved excerpts are labeled background and never count as application evidence. The library and the Kestrel reference directory remain outside Git.
+
+## Persistence and controls
+
+Data lives in Electron's `userData` directory (normally `~/Library/Application Support/QA Arena` on macOS): `qa-arena.sqlite`, `runtime-settings.json`, snapshots, runs, and content-addressed evidence. Test-account headers live in the local SQLite database, whose file permissions are restricted to the current user; they are not encrypted in a separate vault. Renderer queries return only account names/header names/configuration status. Host-injected values are redacted from captured HTTP responses and regression logs.
+
+Runs freeze the snapshot, scope, lineup, limits, and DNA version. Start requests are idempotent. A single queue executes runs; pause takes effect at a safe checkpoint. Cancellation stops workers, revokes their leases, and rejects late writes. Restart marks interrupted active work failed/cancelled and continues queued work. Live view and event replay use the same reducer. Evidence is checked against its hash when opened or exported. Test accounts cannot change while their project has active/queued work. Operator decisions preserve the original host verdict.
+
+This build uses a new database name and does not migrate the earlier test-case prototype's `kestrel-qa.sqlite` file.
+
+## Verification
+
+```bash
 npm run typecheck
+npm run build
+npm test                 # unit/protocol tests + real local HTTP integration
+npm run test:isolated    # same suite with an in-process sample HTTP transport
+npm run check:desktop    # real Electron UI + nine screenshots, isolated database
+npm run test:live        # actual Claude and Codex CLI + MCP connectivity; uses model accounts
 ```
 
-On first launch the app seeds a **Demo Shop** project. It serves a tiny shop on `http://127.0.0.1:4870` with one planted defect: `SAVE20` takes 25% off instead of 20%. Start a run, and the `checkout-discount-20` case fails with `expected total == 96 · actual total == 90`.
+The isolated transport invokes the real sample request handler without opening a socket. It also executes the generated regression test files in Node subprocesses, first against defective behavior and then against repaired behavior. It is not a substitute for real TCP or desktop checks. Live-provider checks are a separate explicit command so normal tests never consume model usage.
 
-Data lives in Electron's `userData` folder (`~/Library/Application Support/kestrel-qa/` on macOS): `kestrel-qa.sqlite`, `evidence/<sha256>`, `agent-settings.json`.
+Validation in the restricted development session on 2026-10-27:
 
-## Agents
+- Typecheck and production build passed.
+- 54 isolated tests passed, covering the five-phase sample, repaired regressions, debate revisions, cancellation/timeouts, pause/resume, orphan recovery, scope, redaction, import validation, API reviews, versioned DNA, paginated replay, and CLI protocol errors.
+- The standard suite's two HTTP pipeline checks were blocked by `listen EPERM` on `127.0.0.1`; the remaining 52 tests passed.
+- Both live-provider checks were blocked at gateway startup by the same port restriction, before model execution.
+- Staging the app with Git failed because this session cannot create `.git/index.lock`; the continuation is not committed or pushed.
+- Launching Electron exited with `SIGABRT` before a window opened. The automated desktop check hit the same abort. Desktop click-through and screenshots are still unverified.
 
-| Adapter | What it does |
-| --- | --- |
-| **Scripted** | No model. Follows each step's literal request. Always available, used by the tests. |
-| **oh-my-pi** | Spawns `omp --mode rpc` for each attempt ([oh-my-pi](https://github.com/can1357/oh-my-pi)). Built-in tools are off (`--no-tools`). The app registers QA host tools with `set_host_tools`, so the model can act only through `qa_step`, `qa_http_request`, `qa_note`, and `qa_report_blocked`. |
+Remaining acceptance checks on an unrestricted local session: run `npm test`, `npm run test:live`, and `npm run check:desktop`; launch the app; complete one offline Sample Shop audit; inspect/export evidence; exercise review/DNA decisions and account sign-in; capture all six screens. Packaging and code signing are not configured.
 
-To use oh-my-pi:
+## Source layout
 
-```bash
-brew install can1357/tap/omp      # or: curl -fsSL https://omp.sh/install | sh
-omp                               # sign in to a model provider once (/login)
+```text
+resources/       sample shop and stdio MCP bridge
+src/shared/      domain, questionnaire, verdicts, lifecycle, event fold, IPC
+src/main/        orchestration, store, tools, verification, imports, accounts, runtimes
+src/preload/     narrow query/command/event bridge
+src/renderer/    React screens and custom SVG icons
+tests/           integration, API, tool, runtime fixtures, opt-in live-provider checks
 ```
-
-Then choose oh-my-pi on the **Agent** screen or in the New run panel. A model, and optional built-in tools such as `browser`, are set there. Traffic from built-in tools is not checked against the environment's allowed origins, and the UI warns about this.
-
-## Rules the code enforces
-
-- **Immutable run contract.** The suite version, build, environment snapshot, agent profile, and initiator are hashed at start. Reusing an idempotency key with a different contract is rejected.
-- **Explicit lifecycle.** `queued → running ⇄ pause_requested → paused`, `cancel_requested → cancelled`, `completed`, `failed`. Illegal transitions throw. A cancel request latches. A failed assertion still *completes* the run; the run is marked `failed` only when orchestration breaks.
-- **Commands record intent.** Pause and cancel return `*_requested`. The worker acknowledges at a safe boundary in a separate event. If it does not stop within the grace period, its lease generation is revoked, the run is cancelled with `force_stopped`, and any late write is rejected.
-- **Code is the authority.** An assertion without an observation is `blocked`, never `passed`. An empty, malformed, crashed, or timed-out agent produces an `error`.
-- **Tool policy.** Requests are limited to allowed origins. Mutating methods require environment permission. Credential headers are refused. Each tool call ID executes once.
-- **Evidence.** Content-addressed blobs are re-hashed on every read. `set-cookie` and auth headers are redacted before storage.
-- **One fold.** `src/shared/fold.ts` drives live, catch-up, and replay views. A test checks that live with duplicate delivery equals a cold replay at every playhead.
-- **Restart recovery.** Runs left active by a previous process are marked failed, or cancelled if cancellation had been requested, and their leases are revoked.
-
-## Layout
-
-```
-src/shared/      domain types, lifecycle tables, event registry, fold, assertions, IPC contract
-src/main/        composition root (index.ts), SQLite store, evidence store, orchestrator,
-                 tool belt, adapters/{scripted,omp}, API, demo app + seed
-src/preload/     contextBridge: query / command / subscribe
-src/renderer/    React UI: Runs, Run workspace (live + replay), Review, Projects, Agent
-tests/           vitest suites + fake omp speaking the RPC protocol
-```
-
-## Not built yet (phases 3–4 from the reference README)
-
-- Browser tool through host tools (screenshots, traces) with origin policy
-- Real secret store (refs exist; nothing resolves them yet), per-environment leases, fixtures and cleanup
-- Retries as new attempts from the UI, suite editing UI, worker pools, retention
-- Packaging (`electron-builder`) and code signing

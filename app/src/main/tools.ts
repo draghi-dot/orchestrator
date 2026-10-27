@@ -78,6 +78,7 @@ const REPRO_SCHEMA = {
           method: { type: 'string', enum: HTTP_METHODS },
           path: s('Path starting with /.'),
           body: s('Optional body.'),
+          headers: { type: 'object', additionalProperties: { type: 'string' }, description: 'Only accept, content-type, accept-language.' },
           as: s('Optional approved test account name.'),
         },
         ['method', 'path'],
@@ -293,6 +294,7 @@ function isBinary(data: Buffer): boolean {
 export class TaskTools {
   blockedReason: string | null = null
   private calls = 0
+  private readonly pending = new Map<string, Promise<ToolCallResult>>()
 
   constructor(private readonly deps: TaskToolsDeps) {}
 
@@ -312,7 +314,7 @@ export class TaskTools {
     const role = this.deps.lease.role
     const app = this.appTargets().base !== null
     const knowledge = audit.useKnowledge && (this.deps.knowledge?.size ?? 0) > 0
-    if (role === 'builder') return { code: true, http: app, commands: allowCommands && this.deps.workdir !== null, knowledge: false }
+    if (role === 'builder') return { code: true, http: true, commands: allowCommands && this.deps.workdir !== null, knowledge: false }
     return { code: mode !== 'black', http: mode !== 'white' && app, commands: false, knowledge }
   }
 
@@ -345,6 +347,16 @@ export class TaskTools {
   }
 
   async call(toolCallId: string, name: string, rawArgs: unknown): Promise<ToolCallResult> {
+    this.deps.store.assertOwner(this.deps.lease)
+    this.deps.signal.throwIfAborted()
+    const existing = this.pending.get(toolCallId)
+    if (existing) return existing
+    const task = this.invoke(toolCallId, name, rawArgs)
+    this.pending.set(toolCallId, task)
+    try { return await task } finally { this.pending.delete(toolCallId) }
+  }
+
+  private async invoke(toolCallId: string, name: string, rawArgs: unknown): Promise<ToolCallResult> {
     const { store, lease } = this.deps
     if (!toolCallId) return { ok: false, summary: 'tool call id is required' }
     const cached = store.getToolCall(lease.taskId, toolCallId) as ToolCallResult | undefined
@@ -633,7 +645,14 @@ export class TaskTools {
     const command = str(args.command).trim()
     const healthPath = str(args.health_path).startsWith('/') ? str(args.health_path) : '/'
     const readyTimeout = Math.min(180, Math.max(5, Number(args.ready_timeout_seconds) || 90))
-    const started = await processes.startApp(lease.runId, command, workdir, { healthPath, readyTimeoutMs: readyTimeout * 1000, signal: this.deps.signal })
+    const env: Record<string, string> = {}
+    if (store.getTarget(this.deps.run.contract.targetId).source.kind === 'sample') {
+      for (const name of ['alice', 'bob']) {
+        const header = store.testAccountHeader(this.deps.run.contract.targetId, name)
+        if (header) env[`QA_SAMPLE_${name.toUpperCase()}`] = header.value
+      }
+    }
+    const started = await processes.startApp(lease.runId, command, workdir, { healthPath, readyTimeoutMs: readyTimeout * 1000, signal: this.deps.signal, env })
     store.setAppUrl(lease.runId, started.url)
     const bytes = new TextEncoder().encode(`$ ${command}\n\n${started.log}`)
     store.recordArtifact(lease.runId, lease, { sha256: evidence.put(bytes), mime: 'text/plain; charset=utf-8', bytes: bytes.byteLength, label: `App startup log (${bounded(command, 40)})`, redaction: 'none' })
@@ -653,15 +672,26 @@ export class TaskTools {
       const method = str(st.method).toUpperCase()
       if (!HTTP_METHODS.includes(method)) throw new ToolRejection(`step method ${method || '(empty)'} is not supported`)
       let path = str(st.path)
-      if (/^https?:\/\//.test(path)) {
-        const u = new URL(path)
+      const base = this.appTargets().base
+      if (base) {
+        const u = new URL(path, base)
+        if (u.origin !== new URL(base).origin) throw new ToolRejection('Reproduction must stay on the app under test')
         path = `${u.pathname}${u.search}`
       }
       if (!path.startsWith('/')) throw new ToolRejection('step paths start with /')
       const body = st.body === undefined || st.body === null ? undefined : bounded(String(st.body), 10_000)
+      if (body !== undefined && ['GET', 'HEAD'].includes(method)) throw new ToolRejection(`${method} reproductions cannot have a body`)
+      const headers: Record<string, string> = {}
+      if (st.headers !== undefined) {
+        if (!st.headers || typeof st.headers !== 'object' || Array.isArray(st.headers)) throw new ToolRejection('Invalid reproduction headers')
+        for (const [key, value] of Object.entries(st.headers)) {
+          if (!ALLOWED_REQUEST_HEADERS.has(key.toLowerCase()) || typeof value !== 'string' || /[\r\n]/.test(value)) throw new ToolRejection('Only noncredential request headers are allowed in a reproduction')
+          headers[key.toLowerCase()] = value
+        }
+      }
       const as = str(st.as).trim()
       if (as && !this.accounts().includes(as)) throw new ToolRejection(`${as} is not an approved test account for this run`)
-      return { method, path, ...(body !== undefined ? { body } : {}), ...(as ? { as } : {}) }
+      return { method, path, ...(body !== undefined ? { body } : {}), ...(Object.keys(headers).length ? { headers } : {}), ...(as ? { as } : {}) }
     })
     const c = (r.check ?? {}) as Record<string, unknown>
     const kind = str(c.kind) as CheckKind
@@ -907,15 +937,29 @@ export async function performHttp(
     redirect: 'manual',
     signal: AbortSignal.any([deps.signal, AbortSignal.timeout(15_000)]),
   })
-  const { text, truncated } = await readCapped(response, 256 * 1024)
-  let redacted = false
+  const captured = await readCapped(response, 256 * 1024)
+  const truncated = captured.truncated
+  let redacted = !!args.account
+  const run = deps.store.getRun(deps.runId)
+  const secrets = deps.store.listTestAccounts(run.contract.targetId).map((a) => deps.store.testAccountHeader(run.contract.targetId, a.name)?.value).filter((v): v is string => !!v)
+  if (args.account?.value) secrets.push(args.account.value)
+  const redact = (value: string) => {
+    let safe = value
+    for (const secret of secrets) {
+      for (const form of [secret, secret.replace(/^Bearer /i, '')]) {
+        if (form && safe.includes(form)) { safe = safe.split(form).join('[redacted]'); redacted = true }
+      }
+    }
+    return safe
+  }
+  const text = redact(captured.text)
   const headerLines: string[] = []
   response.headers.forEach((value, name) => {
     if (REDACTED_RESPONSE_HEADERS.has(name.toLowerCase())) {
       redacted = true
       headerLines.push(`${name}: [redacted]`)
     } else {
-      headerLines.push(`${name}: ${value}`)
+      headerLines.push(`${name}: ${redact(value)}`)
     }
   })
   const as = args.account ? ` (as ${args.account.account}, ${args.account.name} redacted)` : ''

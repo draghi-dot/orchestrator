@@ -5,8 +5,8 @@
  * states about percentages, which is enough to show the loop end to end.
  */
 
-import type { Check, Role } from '../../shared/domain'
-import { evaluateCheck } from '../../shared/verdict'
+import type { Check, Role, Reproduction } from '../../shared/domain'
+import { evaluateCheck, normalizeCode } from '../../shared/verdict'
 import type { ToolCallResult } from '../tools'
 import type { AgentRuntime, Assignment, Outcome, RuntimeContext } from './types'
 import { sleep } from './types'
@@ -59,7 +59,7 @@ export class OfflineRuntime implements AgentRuntime {
         case 'builder':
           return await this.build(assignment, ctx)
         case 'researcher':
-          return await this.research(assignment, ctx)
+          return ctx.tools.purpose === 'revise' ? await this.revise(ctx) : assignment.context.targetName === 'Sample Shop' ? await this.sampleResearch(ctx) : await this.research(assignment, ctx)
         case 'thinker':
           return await this.challenge(ctx)
         case 'reporter':
@@ -78,7 +78,9 @@ export class OfflineRuntime implements AgentRuntime {
     await ctx.checkpoint()
     if (this.options.stepDelayMs) await sleep(this.options.stepDelayMs, ctx.signal)
     this.counter += 1
-    return ctx.tools.call(`${ctx.tools.lease.taskId}:${this.counter}:${tool}`, tool, args)
+    const result = await ctx.tools.call(`${ctx.tools.lease.taskId}:${this.counter}:${tool}`, tool, args)
+    if (!result.ok && ['propose_claim', 'challenge_claim', 'revise_claim', 'write_report'].includes(tool)) throw new Error(result.summary)
+    return result
   }
 
   private blocked(reason: string): Outcome {
@@ -121,7 +123,7 @@ export class OfflineRuntime implements AgentRuntime {
   private async research(a: Assignment, ctx: RuntimeContext): Promise<Outcome> {
     const access = ctx.tools.access()
     const rules = new Map<string, StatedRule & { source: string }>()
-    const codeFindings: { code: string; percent: number; actual: number; location: string }[] = []
+    const codeFindings: { code: string; percent: number; actual: number; location: string; quote: string }[] = []
 
     if (access.code) {
       const listing = await this.call(ctx, 'list_files', { depth: 3 })
@@ -146,7 +148,7 @@ export class OfflineRuntime implements AgentRuntime {
           if (!m || !line.includes(rule.code) || SOURCE_EXT.test(m[1]) === false) continue
           const value = Number(m[3])
           const actualPercent = value <= 1 ? round2(value * 100) : value
-          if (actualPercent !== rule.percent) codeFindings.push({ code: rule.code, percent: rule.percent, actual: actualPercent, location: `${m[1]}:${m[2]}` })
+          if (actualPercent !== rule.percent) codeFindings.push({ code: rule.code, percent: rule.percent, actual: actualPercent, location: `${m[1]}:${m[2]}`, quote: line.replace(/^.+?:\d+: /, '') })
         }
       }
     }
@@ -183,6 +185,9 @@ export class OfflineRuntime implements AgentRuntime {
             title: `${rule.code} does not take ${rule.percent}% off the cart`,
             detail: `${rule.source} says ${rule.code} gives ${rule.percent}% off. For subtotal ${parsed.subtotal} the total should be ${expected}, but the app returned ${parsed.total}.`,
             severity: 'high',
+            category: 'business_logic',
+            severity_rationale: 'Incorrect pricing changes what every customer pays.',
+            suggested_fix: 'Apply the documented discount rate to the merchandise subtotal.',
             location: finding?.location ?? `GET ${form.action}`,
             reproduction: { steps: [{ method: 'GET', path }], check },
           })
@@ -197,6 +202,10 @@ export class OfflineRuntime implements AgentRuntime {
         title: `${f.code} is coded as ${f.actual}% off, not ${f.percent}%`,
         detail: `The README states ${f.code} gives ${f.percent}% off, but ${f.location} sets it to ${f.actual}%.`,
         severity: 'high',
+        category: 'business_logic',
+        severity_rationale: 'Incorrect pricing changes what every customer pays.',
+        suggested_fix: 'Align the stored percentage with the documented offer.',
+        evidence_quote: f.quote,
         location: f.location,
       })
     }
@@ -204,17 +213,82 @@ export class OfflineRuntime implements AgentRuntime {
     return { kind: 'finished', reason: 'research done' }
   }
 
+  /** Repeatable sample-fixture probes, including one intentional false claim.
+   * Verdicts still come only from the challenger's actual requests and host replay. */
+  private async sampleResearch(ctx: RuntimeContext): Promise<Outcome> {
+    const http = ctx.tools.access().http
+    const code = ctx.tools.access().code
+    if (ctx.tools.access().knowledge) await this.call(ctx, 'search_knowledge', { query: 'authorization ownership business logic boundary validation' })
+    let source = ''
+    if (code) {
+      await this.call(ctx, 'read_file', { path: 'README.md' })
+      const read = await this.call(ctx, 'read_file', { path: 'server.mjs' })
+      source = String(data(read) ?? '')
+    }
+    if (http) await this.call(ctx, 'http_request', { method: 'GET', path: '/' })
+    const probes = [
+      { title: 'SAVE20 applies the wrong discount', path: '/api/cart?code=SAVE20', kind: 'json_equals', field: 'total', expected: 96, category: 'business_logic', severity: 'high', rule: 'SAVE20 promises 20% off the $120 subtotal.', quote: 'const rates = { SAVE10: 0.10, SAVE20: 0.15 }', fix: 'Use 0.20 for the SAVE20 rate.' },
+      { title: 'Alice can read Bob’s private order', path: '/api/orders/102', as: 'alice', kind: 'status_equals', expected: 403, category: 'authorization', severity: 'high', rule: 'Customers may read only their own orders; another owner must return 403.', quote: 'return order ? json(200, order) : json(404, { error: \'not_found\' })', fix: 'Compare the authenticated customer with order.owner before returning the order.' },
+      { title: 'Free shipping fails at the exact $100 threshold', path: '/api/shipping?subtotal=100', kind: 'json_equals', field: 'shipping', expected: 0, category: 'business_logic', severity: 'medium', rule: 'Shipping is free for a subtotal of $100 or more.', quote: 'const shipping = (subtotal) => subtotal > 100 ? 0 : 8', fix: 'Include equality when checking the free-shipping threshold.' },
+      { title: 'Negative quantity is accepted by the cart', path: '/api/cart?quantity=-1', kind: 'status_equals', expected: 422, category: 'input_validation', severity: 'high', rule: 'Quantities must be integers between 1 and 99; invalid values return 422.', quote: "if (!Number.isInteger(quantity) || quantity > 99) return json(422, { error: 'invalid_quantity' })", fix: 'Reject quantities below 1 before calculating prices.' },
+      { title: 'Unknown coupons are accepted (decoy probe)', path: '/api/cart?code=UNKNOWN', kind: 'status_equals', expected: 422, category: 'input_validation', severity: 'low', rule: 'Unknown coupons should return HTTP 422. This deliberate sample decoy exercises rejection.', quote: 'const acceptUnknownCoupons = true', fix: 'Keep rejecting unknown coupon codes.' },
+    ] as const
+    for (const p of probes) {
+      if ('as' in p && !ctx.tools.accounts().includes(p.as)) {
+        await this.call(ctx, 'note', { text: 'Order isolation not tested: the alice test account was not approved.' })
+        continue
+      }
+      await this.call(ctx, 'note_surface', { kind: 'rule', name: p.rule })
+      const step = { method: 'GET', path: p.path, ...('as' in p ? { as: p.as } : {}) }
+      let observed = ''
+      if (http) {
+        const response = await this.call(ctx, 'http_request', { ...step })
+        if (!response.ok) continue
+        observed = JSON.stringify(data(response))
+      }
+      const line = source.split('\n').find((l) => l.includes(p.quote))
+      const lineNo = line ? Number(/^\s*(\d+)/.exec(line)?.[1] ?? 1) : 1
+      const reproduction: Reproduction | undefined = http ? { steps: [step], check: { kind: p.kind, ...('field' in p ? { path: p.field } : {}), expected: p.expected } } : undefined
+      if (!http && !line && p.title.indexOf('decoy') === -1) continue
+      await this.call(ctx, 'propose_claim', {
+        title: p.title, detail: `${p.rule} ${http ? 'Observed response: ' + observed : 'The source contains the quoted implementation.'}`,
+        category: p.category, severity: p.severity,
+        severity_rationale: p.category === 'authorization' ? 'Exposes another customer’s private order and address.' : 'Affects customer billing or input validation in checkout.',
+        suggested_fix: p.fix,
+        ...(code ? { location: `server.mjs:${lineNo}`, evidence_quote: p.quote } : {}),
+        ...(reproduction ? { reproduction } : {}),
+      })
+    }
+    return { kind: 'finished', reason: 'Sample probes completed; the host must decide the findings' }
+  }
+
+  private async revise(ctx: RuntimeContext): Promise<Outcome> {
+    const claims = data(await this.call(ctx, 'list_claims', {})) as unknown as { claim_id: string; detail: string; location: string | null; evidence_quote: string | null; reproduction: Reproduction | null; host_check: { outcome: string } | null }[]
+    for (const c of claims ?? []) {
+      if (c.host_check?.outcome === 'not_reproduced' || c.host_check?.outcome === 'code_missing') {
+        await this.call(ctx, 'revise_claim', { claim_id: c.claim_id, action: 'withdraw' })
+      } else if (c.reproduction || c.evidence_quote) {
+        await this.call(ctx, 'revise_claim', { claim_id: c.claim_id, action: 'amend', detail: c.detail, location: c.location, evidence_quote: c.evidence_quote, reproduction: c.reproduction })
+      }
+    }
+    return { kind: 'finished', reason: 'Answered contested findings' }
+  }
+
   // ----------------------------------------------------------------- thinker
 
   private async challenge(ctx: RuntimeContext): Promise<Outcome> {
     const access = ctx.tools.access()
     const listed = await this.call(ctx, 'list_claims', {})
-    const claims = (data(listed) as unknown as { claim_id: string; reproduction: { steps: { method: string; path: string; body?: string }[]; check: Check } | null; location: string | null }[]) ?? []
+    const claims = (data(listed) as unknown as { claim_id: string; reproduction: Reproduction | null; location: string | null; evidence_quote: string | null }[]) ?? []
     for (const claim of claims) {
       if (claim.reproduction && access.http) {
         let last: Record<string, unknown> | undefined
-        for (const step of claim.reproduction.steps) last = data(await this.call(ctx, 'http_request', step)) as Record<string, unknown> | undefined
-        const result = evaluateCheck(claim.reproduction.check, { status: Number(last?.status ?? 0), bodyText: String(last?.body ?? '') })
+        for (const step of claim.reproduction.steps) last = data(await this.call(ctx, 'http_request', { ...step })) as Record<string, unknown> | undefined
+        if (!last || !Number.isFinite(Number(last.status))) {
+          await this.call(ctx, 'challenge_claim', { claim_id: claim.claim_id, stance: 'unsure', reasoning: 'The HTTP request did not yield a usable response.' })
+          continue
+        }
+        const result = evaluateCheck(claim.reproduction.check, { status: Number(last.status), bodyText: String(last.body ?? '') })
         await this.call(ctx, 'challenge_claim', {
           claim_id: claim.claim_id,
           stance: result.passed ? 'dispute' : 'agree',
@@ -225,10 +299,11 @@ export class OfflineRuntime implements AgentRuntime {
       } else if (claim.location && access.code && /:\d+$/.test(claim.location)) {
         const [file, line] = [claim.location.replace(/:\d+$/, ''), Number(claim.location.split(':').pop())]
         const read = await this.call(ctx, 'read_file', { path: file, start_line: line, end_line: line })
+        const matches = read.ok && !!claim.evidence_quote && normalizeCode(String(data(read) ?? '')).includes(normalizeCode(claim.evidence_quote))
         await this.call(ctx, 'challenge_claim', {
           claim_id: claim.claim_id,
-          stance: read.ok ? 'agree' : 'unsure',
-          reasoning: read.ok ? `The cited line still reads: ${String(data(read) ?? '').trim()}` : `I could not read ${claim.location}.`,
+          stance: matches ? 'agree' : 'dispute',
+          reasoning: matches ? `The cited line matches the stated defect: ${String(data(read) ?? '').trim()}` : `The quoted evidence could not be matched at ${claim.location}.`,
         })
       } else {
         await this.call(ctx, 'challenge_claim', { claim_id: claim.claim_id, stance: 'unsure', reasoning: 'There is no reproduction or code location I can check in this mode.' })
@@ -248,22 +323,22 @@ export class OfflineRuntime implements AgentRuntime {
     }
     const by = (status: string) => summary.claims.filter((c) => c.status === status)
     const confirmed = by('confirmed')
-    const open = summary.claims.filter((c) => c.status === 'disputed' || c.status === 'unverified' || c.status === 'open')
-    const refuted = by('refuted')
+    const open = summary.claims.filter((c) => c.status === 'needs_review' || c.status === 'inconclusive' || c.status === 'candidate')
+    const rejected = by('rejected')
     const lines = [
       `# ${summary.app.name} QA report`,
       '',
       '## Summary',
-      `${a.context.finalReport ? 'Final' : 'Interim'} report. Mode: ${summary.app.mode}. ${summary.claims.length} claim(s): ${confirmed.length} confirmed, ${refuted.length} refuted, ${open.length} open.`,
+      `${a.context.finalReport ? 'Final' : 'Interim'} report. Mode: ${summary.app.mode}. ${summary.claims.length} claim(s): ${confirmed.length} confirmed, ${rejected.length} rejected, ${open.length} open.`,
       '',
       '## Confirmed defects',
       ...(confirmed.length ? confirmed.map((c) => `- **${c.title}** (${c.severity}) at ${c.location ?? 'n/a'}, claim ${c.claim_id}`) : ['None yet.']),
       '',
-      '## Disputed and unverified',
+      '## Needs review and inconclusive',
       ...(open.length ? open.map((c) => `- ${c.title}: ${c.verdict_reason ?? 'not settled yet'} (claim ${c.claim_id})`) : ['None.']),
       '',
-      '## Refuted',
-      ...(refuted.length ? refuted.map((c) => `- ${c.title} (claim ${c.claim_id})`) : ['None.']),
+      '## Rejected',
+      ...(rejected.length ? rejected.map((c) => `- ${c.title} (claim ${c.claim_id})`) : ['None.']),
       '',
       '## Coverage',
       ...(summary.surface_noted.length ? summary.surface_noted.slice(0, 30).map((s) => `- ${s}`) : ['Nothing mapped.']),
@@ -282,10 +357,10 @@ export class OfflineRuntime implements AgentRuntime {
     const dna = data(await this.call(ctx, 'get_dna', {})) as unknown as { rules: { text: string }[] }
     const has = (text: string) => dna.rules.some((r) => r.text.toLowerCase() === text.toLowerCase())
     const proposals: { role: Role; text: string; rationale: string }[] = []
-    const refuted = summary.claims.filter((c) => c.status === 'refuted').length
+    const rejected = summary.claims.filter((c) => c.status === 'rejected').length
     const confirmed = summary.claims.filter((c) => c.status === 'confirmed').length
-    if (refuted > 0) {
-      proposals.push({ role: 'researcher', text: 'Re-run every reproduction once with http_request and compare the result to your check before you propose the claim.', rationale: `${refuted} claim(s) in this run were refuted when the host replayed them.` })
+    if (rejected > 0) {
+      proposals.push({ role: 'researcher', text: 'Re-run every reproduction once with http_request and compare the result to your check before you propose the claim.', rationale: `${rejected} claim(s) in this run were rejected when the host replayed them.` })
     }
     if (confirmed > 0) {
       proposals.push({ role: 'researcher', text: 'For every percentage, price, or limit the app states, request the endpoint that applies it and compare the numbers.', rationale: `${confirmed} confirmed defect(s) came from checking a stated rule against the returned totals.` })

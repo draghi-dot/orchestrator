@@ -11,13 +11,13 @@ export class ApiError extends Error {
 }
 
 export async function query<K extends QueryName>(name: K, args: Queries[K]['args']): Promise<Queries[K]['result']> {
-  const result = await window.kestrel.query(name, args)
+  const result = await window.qa.query(name, args)
   if (!result.ok) throw new ApiError(result.error.name, result.error.message)
   return result.value
 }
 
 export async function command<C extends Command>(cmd: C): Promise<CommandResults[C['type']]> {
-  const result = await window.kestrel.command(cmd)
+  const result = await window.qa.command(cmd)
   if (!result.ok) throw new ApiError(result.error.name, result.error.message)
   return result.value
 }
@@ -55,6 +55,7 @@ export function useQuery<K extends QueryName>(name: K, args: Queries[K]['args'],
       .finally(() => {
         if (id === latest.current) setLoading(false)
       })
+    return () => { latest.current += 1 }
   }, [name, key, version, tick])
 
   const refetch = useCallback(() => setTick((t) => t + 1), [])

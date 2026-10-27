@@ -76,6 +76,7 @@ export class OmpRuntime implements AgentRuntime {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: true,
       })
+      child.stdin.on('error', () => {})
       const send = (frame: Frame) => {
         if (child.stdin.writable) child.stdin.write(`${JSON.stringify(frame)}\n`)
       }
@@ -99,7 +100,7 @@ export class OmpRuntime implements AgentRuntime {
       child.stderr.on('data', (chunk: Buffer) => {
         stderr = (stderr + chunk.toString('utf8')).slice(-8000)
       })
-      child.on('exit', (code, sig) => {
+      child.on('close', (code, sig) => {
         if (promptResult) return finish({ ...promptResult, exitCode: code })
         const first = stderr.split('\n').map((l) => l.trim()).find(Boolean)
         finish({ kind: 'error', reason: `oh-my-pi exited (code ${code ?? 'null'}${sig ? `, signal ${sig}` : ''}) without a prompt result${first ? `: ${bounded(first, 300)}` : ''}`, exitCode: code })

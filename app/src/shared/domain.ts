@@ -262,6 +262,8 @@ export interface ReproStep {
   method: string
   path: string
   body?: string
+  /** Noncredential request headers, replayed exactly by the host. */
+  headers?: Record<string, string>
   /** Name of an approved test account to send this request as. */
   as?: string
 }

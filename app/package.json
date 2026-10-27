@@ -1,16 +1,19 @@
 {
-  "name": "kestrel-qa",
-  "productName": "Kestrel QA",
+  "name": "qa-arena",
+  "productName": "QA Arena",
   "version": "0.1.0",
   "private": true,
-  "description": "QA orchestration desktop app: agents run test cases, code decides pass/fail.",
+  "description": "Evidence-driven application audits with five worker roles.",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:isolated": "QA_TEST_NO_TCP=1 vitest run",
+    "test:live": "vitest run --config vitest.live.config.mts",
+    "check:desktop": "electron scripts/desktop-check.cjs"
   },
   "devDependencies": {
     "@types/node": "26.6.5",

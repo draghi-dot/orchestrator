@@ -27,6 +27,7 @@ export const DEFAULT_SETTINGS: RuntimeSettings = {
   codexCommand: 'codex',
   ompCommand: 'omp',
   defaultRoster: ARENA_ROSTER,
+  knowledgePath: '',
 }
 
 const RUNTIMES: RuntimeId[] = ['claude', 'codex', 'omp', 'offline']
@@ -47,6 +48,7 @@ export function sanitizeSettings(input: Partial<RuntimeSettings>): RuntimeSettin
     codexCommand: command(input.codexCommand, DEFAULT_SETTINGS.codexCommand),
     ompCommand: command(input.ompCommand, DEFAULT_SETTINGS.ompCommand),
     defaultRoster: roster,
+    knowledgePath: typeof input.knowledgePath === 'string' ? input.knowledgePath.trim() : '',
   }
 }
 

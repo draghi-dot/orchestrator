@@ -12,7 +12,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, normalize, sep } from 'node:path'
 import type { Claim, EvidenceOutcome, Run } from '../shared/domain'
 import { bounded } from '../shared/events'
@@ -65,14 +65,15 @@ async function replay(deps: VerifyDeps, run: Run, claim: Claim): Promise<VerifyR
     for (const step of repro.steps) {
       const result = await performHttp(
         { store: deps.store, evidence: deps.evidence, fetchImpl: deps.fetchImpl, signal: deps.signal, runId: run.id, lease: null, ...targets },
-        { method: step.method, path: step.path, body: step.body, account: accountFor(deps.store, run, step.as) },
+        { method: step.method, path: step.path, body: step.body, headers: step.headers, account: accountFor(deps.store, run, step.as) },
       )
       last = { status: result.status, bodyText: result.bodyText, artifactId: result.artifactId }
     }
   } catch (err) {
     return { outcome: 'error', expected: null, actual: null, detail: `Replay failed: ${bounded(err instanceof Error ? err.message : String(err), 300)}`, artifactId: last?.artifactId ?? null }
   }
-  const result = evaluateCheck(repro.check, last!)
+  if (!last) return { outcome: 'no_evidence', expected: null, actual: null, detail: 'The reproduction has no requests.', artifactId: null }
+  const result = evaluateCheck(repro.check, last)
   return result.passed
     ? { outcome: 'not_reproduced', expected: result.expected, actual: result.actual, detail: `The app returned ${result.actual}, which is what a correct app returns.`, artifactId: last!.artifactId }
     : { outcome: 'reproduced', expected: result.expected, actual: result.actual, detail: `Expected ${result.expected}, got ${result.actual}.`, artifactId: last!.artifactId }
@@ -94,21 +95,15 @@ function checkQuote(store: QaStore, run: Run, claim: Claim): VerifyResult {
   if (!abs.startsWith(root + sep) || !existsSync(abs)) {
     return { outcome: 'code_missing', expected: `quoted code in ${loc.file}`, actual: `${loc.file} does not exist in the snapshot`, detail: 'The cited file is not in the app.', artifactId: null }
   }
+  const rel = loc.file.split(/[\\/]/).filter(Boolean)
+  let cursor = root
+  for (const part of rel) { cursor = join(cursor, part); if (lstatSync(cursor).isSymbolicLink()) return { outcome: 'code_missing', expected: 'a file in the snapshot', actual: 'symbolic link', detail: 'Symlink citations are not allowed.', artifactId: null } }
+  if (run.contract.audit.excludedPaths.some((p) => loc.file === p.replace(/\/$/, '') || loc.file.startsWith(p.replace(/\/$/, '') + '/'))) return { outcome: 'no_evidence', expected: null, actual: null, detail: 'The cited path is excluded from this audit.', artifactId: null }
+  if (!lstatSync(abs).isFile() || lstatSync(abs).size > 2 * 1024 * 1024) return { outcome: 'no_evidence', expected: null, actual: null, detail: 'The cited file cannot be read within the evidence limit.', artifactId: null }
   const lines = readFileSync(abs, 'utf8').split('\n')
-  const near = (from: number, to: number) => normalizeCode(lines.slice(Math.max(0, from), Math.min(lines.length, to)).join('\n'))
-  if (loc.line !== null && near(loc.line - 6, loc.line + 6 + claim.evidenceQuote!.split('\n').length).includes(quote)) {
-    return { outcome: 'code_verified', expected: 'quoted code at the cited line', actual: `found at ${loc.file}:${loc.line}`, detail: 'The quoted code is at the cited location.', artifactId: null }
-  }
-  if (normalizeCode(lines.join('\n')).includes(quote)) {
-    const at = lines.findIndex((l) => normalizeCode(l) !== '' && quote.startsWith(normalizeCode(l)))
-    return {
-      outcome: 'code_verified',
-      expected: 'quoted code at the cited line',
-      actual: `found in ${loc.file}${at >= 0 ? ` at line ${at + 1}` : ''}, not at line ${loc.line ?? '?'}`,
-      detail: 'The quoted code exists in the cited file, a few lines from the cited place.',
-      artifactId: null,
-    }
-  }
+  if (loc.line === null || loc.line < 1) return { outcome: 'no_evidence', expected: null, actual: null, detail: 'Cite an exact file:line for the quote.', artifactId: null }
+  const cited = normalizeCode(lines.slice(loc.line - 1, loc.line - 1 + claim.evidenceQuote!.split('\n').length).join('\n'))
+  if (cited.includes(quote)) return { outcome: 'code_verified', expected: 'quoted code at the cited line', actual: `found at ${loc.file}:${loc.line}`, detail: 'The quote matches the cited source lines.', artifactId: null }
   return { outcome: 'code_missing', expected: 'quoted code in the cited file', actual: `not found in ${loc.file}`, detail: 'The quoted code is not in the cited file.', artifactId: null }
 }
 
@@ -124,7 +119,7 @@ export function regressionTestSource(claim: Claim, appUrl: string): string {
   const title = claim.title.replace(/[\r\n]+/g, ' ').replace(/\*\//g, '* /')
   const steps = repro.steps
     .map((step) => {
-      const headers = step.as ? `account(${lit(step.as)})` : '{}'
+      const headers = step.as ? `{ ...${lit(step.headers ?? {})}, ...account(${lit(step.as)}) }` : lit(step.headers ?? {})
       const body = step.body !== undefined ? `, body: ${lit(step.body)}` : ''
       return `  res = await fetch(new URL(${lit(step.path)}, BASE), { method: ${lit(step.method)}, headers: ${headers}${body}, redirect: 'manual' })`
     })
@@ -172,7 +167,7 @@ export async function writeRegressionTest(
   deps: VerifyDeps & { runDir: string; node: NodeRunner },
   run: Run,
   claim: Claim,
-): Promise<{ artifactId: string; failsNow: boolean } | null> {
+): Promise<{ artifactId: string; failsNow: boolean; execution: 'passed' | 'failed_assertion' | 'error' } | null> {
   if (!claim.reproduction) return null
   const appUrl = appTargets(deps.store, run).base
   if (!appUrl) return null
@@ -181,6 +176,21 @@ export async function writeRegressionTest(
   mkdirSync(dir, { recursive: true })
   const file = join(dir, `${claim.id}.test.mjs`)
   writeFileSync(file, source)
+  const reporter = join(dir, 'qa-reporter.mjs')
+  // Read the runner's structured error code. A title or error message containing
+  // ERR_ASSERTION must never turn a startup/network failure into proof of a bug.
+  writeFileSync(reporter, `export default async function* (events) {
+    for await (const event of events) {
+      if (event.type === 'test:fail') {
+        const error = event.data.details?.error
+        const assertion = error?.code === 'ERR_ASSERTION' || error?.cause?.code === 'ERR_ASSERTION'
+        yield JSON.stringify({ type: 'failure', assertion, name: event.data.name, message: error?.message, cause: error?.cause?.message }) + '\\n'
+      } else if (event.type === 'test:pass') {
+        yield JSON.stringify({ type: 'pass', name: event.data.name }) + '\\n'
+      }
+    }
+  }`)
+
 
   const env: Record<string, string> = { ...deps.node.env, APP_URL: appUrl, PATH: process.env.PATH ?? '', NO_COLOR: '1' }
   for (const step of claim.reproduction.steps) {
@@ -193,24 +203,37 @@ export async function writeRegressionTest(
   }
   const { code, output } = await new Promise<{ code: number | null; output: string }>((resolve) => {
     let out = ''
-    const child = spawn(deps.node.command, ['--test', file], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] })
-    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000)
+    const child = spawn(deps.node.command, ['--test-reporter', reporter, '--test', file], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const abort = () => child.kill('SIGKILL')
+    deps.signal.addEventListener('abort', abort, { once: true })
+    if (deps.signal.aborted) abort()
+    const timer = setTimeout(abort, 30_000)
     child.stdout.on('data', (d: Buffer) => (out = (out + d.toString('utf8')).slice(-8000)))
     child.stderr.on('data', (d: Buffer) => (out = (out + d.toString('utf8')).slice(-8000)))
     child.on('error', (err) => {
       clearTimeout(timer)
+      deps.signal.removeEventListener('abort', abort)
       resolve({ code: null, output: err.message })
     })
     child.on('close', (c) => {
       clearTimeout(timer)
+      deps.signal.removeEventListener('abort', abort)
       resolve({ code: c, output: out })
     })
   })
   // Credentials were passed by environment only; keep them out of the log.
   let log = output
-  for (const [k, v] of Object.entries(env)) if (k.endsWith('_VALUE') && v) log = log.split(v).join('[redacted]')
-  const failsNow = code !== 0
-  const text = `${source}\n// ---- run on ${new Date().toISOString()} against ${appUrl}: ${failsNow ? 'FAILS (defect present)' : 'PASSES'} (exit ${code})\n/*\n${log.replace(/\*\//g, '* /')}\n*/\n`
+  for (const [k, v] of Object.entries(env)) if (k.endsWith('_VALUE') && v) {
+    log = log.split(v).join('[redacted]')
+    const token = v.replace(/^Bearer\s+/i, '')
+    if (token) log = log.split(token).join('[redacted]')
+  }
+  const assertionFailed = output.split('\n').some((line) => {
+    try { const result = JSON.parse(line); return result.type === 'failure' && result.assertion === true } catch { return false }
+  })
+  const failsNow = code !== null && code !== 0 && assertionFailed
+  const execution = code === 0 ? 'passed' : failsNow ? 'failed_assertion' : 'error'
+  const text = `${source}\n// ---- run on ${new Date().toISOString()} against ${appUrl}: ${failsNow ? 'FAILS (assertion)' : code === 0 ? 'PASSES' : 'EXECUTION ERROR'} (exit ${code})\n/*\n${log.replace(/\*\//g, '* /')}\n*/\n`
   const bytes = new TextEncoder().encode(text)
   const artifact = deps.store.recordArtifact(run.id, null, {
     sha256: deps.evidence.put(bytes),
@@ -220,5 +243,5 @@ export async function writeRegressionTest(
     redaction: 'none',
   })
   deps.store.setRegressionTest(claim.id, artifact.id, failsNow)
-  return { artifactId: artifact.id, failsNow }
+  return { artifactId: artifact.id, failsNow, execution }
 }

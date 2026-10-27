@@ -1,128 +1,148 @@
-/**
- * The API layer (after Kestrel's apps/api + ops_dashboard routes): owns
- * operator intent, maps commands onto the orchestrator, and serves read
- * models. Electron-agnostic so it can be tested without a window.
- */
-
-import type { AgentProfile, Environment } from '../shared/domain'
-import type { Command, CommandResults, Queries, QueryName, ReviewItem } from '../shared/ipc'
-import { EvidenceIntegrityError, type EvidenceStore } from './evidence'
+/** Host API: validates operator intent and serves durable read models. */
+import { statSync } from 'node:fs'
+import { join } from 'node:path'
+import type { Claim, RuntimeId } from '../shared/domain'
+import { TERMINAL_RUN_STATES } from '../shared/domain'
+import type { Command, CommandResults, Finding, Queries, QueryName, RunDetail } from '../shared/ipc'
+import type { AccountManager } from './accounts'
+import type { EvidenceStore } from './evidence'
+import { listFiles, type Importer } from './importer'
+import type { KnowledgeBase } from './knowledge'
 import type { Orchestrator } from './orchestrator'
-import { type SettingsStore, probeOmp } from './settings'
+import { type SettingsStore, sanitizeRoster } from './settings'
 import type { QaStore } from './store'
 
-const MAX_ARTIFACT_TEXT = 512 * 1024
-
 export class ControlPlaneApi {
-  constructor(
-    private readonly deps: {
-      store: QaStore
-      evidence: EvidenceStore
-      orchestrator: Orchestrator
-      settings: SettingsStore
-      operator: string
-    },
-  ) {}
+  constructor(private readonly deps: {
+    store: QaStore; evidence: EvidenceStore; orchestrator: Orchestrator; settings: SettingsStore;
+    importer: Importer; accounts: AccountManager; operator: string; knowledge: () => KnowledgeBase | null;
+    chooseZip: () => Promise<{ fileName: string; data: Uint8Array } | null>;
+    saveFile: (name: string, data: Uint8Array) => Promise<string | null>;
+    openUrl: (url: string) => Promise<void>;
+  }) {}
 
-  private publicEnvironment(env: Environment) {
-    return { ...env, secretRefs: env.secretRefs.map((s) => ({ name: s.name, configured: s.ref.length > 0 })) }
+  private finding(c: Claim): Finding {
+    const s = this.deps.store
+    return { ...c, challenges: s.listChallenges(c.id), verifications: s.listVerifications(c.id), review: s.getReview(c.id) }
   }
 
   async query<K extends QueryName>(name: K, args: Queries[K]['args']): Promise<Queries[K]['result']> {
-    const { store, evidence, settings } = this.deps
+    const { store, evidence, settings, accounts, knowledge } = this.deps
     const a = (args ?? {}) as Record<string, string>
+    let result: unknown
     switch (name) {
-      case 'overview': {
-        const result: Queries['overview']['result'] = {
-          projects: store.listProjects(),
-          environments: store.listEnvironments().map((e) => this.publicEnvironment(e)),
-          suites: store.listSuites().map((s) => ({ ...s, versions: store.listSuiteVersions(s.id) })),
-          operator: this.deps.operator,
-        }
-        return result as Queries[K]['result']
+      case 'overview': result = { targets: store.listTargets(), operator: this.deps.operator, knowledgeDocs: knowledge()?.size ?? 0 }; break
+      case 'targetSetup': result = { target: store.getTarget(a.targetId), accounts: store.listTestAccounts(a.targetId), knowledgeDocs: knowledge()?.size ?? 0 }; break
+      case 'targetFiles': {
+        const snapshot = store.getSnapshot(a.snapshotId)
+        result = listFiles(snapshot.rootPath).map((path) => ({ path, type: 'file', bytes: statSync(join(snapshot.rootPath, path)).size })); break
       }
-      case 'listRuns':
-        // Terminal runs carry their frozen summary; live ones are summarized now.
-        return store.listRuns().map((r) => (r.summary ? r : { ...r, summary: store.summarize(r.id) })) as Queries[K]['result']
+      case 'listRuns': result = store.listRuns().map((r) => ({ ...r, summary: r.summary ?? store.summarize(r.id) })); break
       case 'runDetail': {
         const run = store.getRun(a.runId)
-        return { run, attempts: store.listAttempts(run.id), suiteVersion: store.getSuiteVersion(run.contract.suiteVersionId) } as Queries[K]['result']
+        const claims = store.listClaims(run.id).map((c) => this.finding(c))
+        const known = store.listGroundTruth(run.contract.targetId)
+        const matches = known.map((b) => ({ title: b.title, found: claims.some((c) => (c.status === 'confirmed' || c.review?.decision === 'accepted') && c.review?.decision !== 'rejected' && b.match.some((m) => (c.title + ' ' + c.detail).toLowerCase().includes(m.toLowerCase()))) }))
+        result = { run: { ...run, summary: run.summary ?? store.summarize(run.id) }, tasks: store.listTasks(run.id), claims,
+          report: store.latestReport(run.id), reports: store.listReports(run.id), ruleChanges: store.listRuleChanges({ runId: run.id }),
+          sampleScore: known.length ? { knownBugs: known.length, matchedBugs: matches.filter((m) => m.found).length, matches } : null,
+        } satisfies RunDetail
+        break
       }
+      case 'findings': result = store.listAllClaims().map((c) => ({ claim: this.finding(c), run: store.getRun(c.runId) })); break
+      case 'reviewQueue': result = store.listReviewQueue().map((c) => ({ claim: this.finding(c), run: store.getRun(c.runId) })); break
       case 'artifact': {
         const artifact = store.getArtifact(a.artifactId)
         try {
           const bytes = evidence.get(artifact.sha256)
-          const isText = /^(text\/|application\/(json|xml))/.test(artifact.mime)
-          const text = isText ? bytes.subarray(0, MAX_ARTIFACT_TEXT).toString('utf8') : null
-          return { artifact, text, verified: true, error: null } as Queries[K]['result']
-        } catch (err) {
-          const message = err instanceof EvidenceIntegrityError ? err.message : `evidence unavailable: ${(err as Error).message}`
-          return { artifact, text: null, verified: false, error: message } as Queries[K]['result']
-        }
+          const isText = /^(text\/|application\/(json|xml|javascript))/.test(artifact.mime)
+          result = { artifact, text: isText ? bytes.subarray(0, 512 * 1024).toString('utf8') : null, verified: true, error: null }
+        } catch (err) { result = { artifact, text: null, verified: false, error: String(err) } }
+        break
       }
-      case 'reviewQueue': {
-        const items: ReviewItem[] = store.listReviewQueue().map((attempt) => {
-          const run = store.getRun(attempt.runId)
-          const version = store.getSuiteVersion(run.contract.suiteVersionId)
-          const artifactIds = new Set<string>()
-          const assertions = store.listAssertionResults(attempt.id)
-          for (const r of assertions) for (const id of r.artifactIds) artifactIds.add(id)
-          return {
-            attempt,
-            run,
-            caseTitle: version.cases.find((c) => c.id === attempt.caseId)?.title ?? attempt.caseId,
-            assertions,
-            artifacts: [...artifactIds].map((id) => store.getArtifact(id)),
-          }
-        })
-        return items as Queries[K]['result']
+      case 'dna': {
+        const changes = store.listRuleChanges().map((c) => ({ ...c, targetName: store.getRun(c.runId).contract.targetName }))
+        result = { current: store.currentDna(), history: store.listDna(), pending: changes.filter((c) => c.status === 'proposed'), decided: changes.filter((c) => c.status !== 'proposed') }; break
       }
-      case 'reviews':
-        return store.listReviews() as Queries[K]['result']
-      case 'settings':
-        return settings.get() as Queries[K]['result']
-      case 'agentStatus':
-        return { omp: await probeOmp(settings.get().ompCommand, settings.get().ompModel) } as Queries[K]['result']
-      default:
-        throw new Error(`unknown query ${String(name)}`)
+      case 'activeLogins': result = accounts.activeLogins(); break
+      case 'accounts': result = await accounts.statuses(); break
+      case 'settings': result = settings.get(); break
+      case 'events': {
+        const input = args as Queries['events']['args']
+        result = store.catchUp(Math.max(0, Number(input.afterSeq) || 0), input.runId, 2000); break
+      }
+      default: throw new Error(`Unknown query ${String(name)}`)
+    }
+    return result as Queries[K]['result']
+  }
+
+  private requireIdleAccount(runtime: RuntimeId): void {
+    if (this.deps.store.activeRuns().some((r) => !TERMINAL_RUN_STATES.has(r.state) && Object.values(r.contract.roster).some((p) => p.runtime === runtime))) {
+      throw new Error('Finish or cancel runs using this provider before changing its sign-in')
+    }
+  }
+
+  private requireIdleTarget(targetId: string): void {
+    if (this.deps.store.activeRuns().some((r) => r.contract.targetId === targetId && !TERMINAL_RUN_STATES.has(r.state))) {
+      throw new Error('Finish or cancel this project’s runs before changing its test accounts')
     }
   }
 
   async command<C extends Command>(command: C): Promise<CommandResults[C['type']]> {
-    const { store, orchestrator, settings, operator } = this.deps
-    type R = CommandResults[C['type']]
+    const { store, orchestrator, settings, importer, accounts, operator } = this.deps
+    let result: unknown
     switch (command.type) {
+      case 'importGithub': result = { targetId: (await importer.importGithub(command.url, command.ref)).id }; break
+      case 'importZip': result = { targetId: importer.importZip(command.fileName, command.data).id }; break
+      case 'chooseZip': {
+        const chosen = await this.deps.chooseZip()
+        result = { targetId: chosen ? importer.importZip(chosen.fileName, chosen.data).id : null }; break
+      }
       case 'startRun': {
-        const s = settings.get()
-        const agent: AgentProfile =
-          command.adapter === 'omp'
-            ? { adapter: 'omp', model: s.ompModel, builtinTools: s.ompBuiltinTools }
-            : { adapter: 'scripted', model: '', builtinTools: [] }
-        const { run, created } = orchestrator.start({
-          idempotencyKey: command.idempotencyKey,
-          suiteVersionId: command.suiteVersionId,
-          environmentId: command.environmentId,
-          caseIds: command.caseIds,
-          buildRevision: command.buildRevision,
-          agent,
-          initiator: operator,
-        })
-        return { runId: run.id, created } as R
+        const { run, created } = orchestrator.start({ ...command, roster: sanitizeRoster(command.roster), initiator: operator })
+        result = { runId: run.id, created }; break
       }
-      case 'pauseRun':
-        return { state: orchestrator.requestPause(command.runId, operator).state } as R
-      case 'resumeRun':
-        return { state: orchestrator.resume(command.runId, operator).state } as R
-      case 'cancelRun':
-        return { state: orchestrator.requestCancel(command.runId, operator).state } as R
-      case 'recordReview': {
-        const review = store.recordReview({ attemptId: command.attemptId, decision: command.decision, reason: command.reason, reviewer: operator })
-        return { reviewId: review.id } as R
+      case 'pauseRun': result = { state: orchestrator.requestPause(command.runId, operator).state }; break
+      case 'resumeRun': result = { state: orchestrator.resume(command.runId, operator).state }; break
+      case 'cancelRun': result = { state: orchestrator.requestCancel(command.runId, operator).state }; break
+      case 'reviewClaim': {
+        if (!['accepted', 'rejected'].includes(command.decision)) throw new Error('Invalid review decision')
+        const claim = store.getClaim(command.claimId)
+        if (!TERMINAL_RUN_STATES.has(store.getRun(claim.runId).state)) throw new Error('Wait for the run to finish before reviewing a finding')
+        result = { reviewId: store.reviewClaim({ ...command, reviewer: operator }).id }; break
       }
-      case 'saveSettings':
-        return settings.save(command.settings) as R
-      default:
-        throw new Error(`unknown command ${(command as { type: string }).type}`)
+      case 'decideRuleChange': {
+        if (!['accepted', 'rejected'].includes(command.decision)) throw new Error('Invalid rule decision')
+        result = { dnaVersion: store.decideRuleChange({ ...command, by: operator }).dna?.version ?? null }; break
+      }
+      case 'setTestAccount':
+        this.requireIdleTarget(command.targetId)
+        store.getTarget(command.targetId)
+        if (!command.headerValue || command.headerValue.length > 8000 || /[\r\n]/.test(command.headerValue)) throw new Error('Enter a nonempty, single-line header value')
+        store.setTestAccount(command.targetId, command.name, command.headerName, command.headerValue)
+        result = { saved: true }; break
+      case 'removeTestAccount': this.requireIdleTarget(command.targetId); store.removeTestAccount(command.targetId, command.name); result = { removed: true }; break
+      case 'saveSettings': result = settings.save(command.settings); break
+      case 'exportReport': {
+        const report = store.latestReport(command.runId)
+        if (!report) throw new Error('No report is available yet')
+        result = { path: await this.deps.saveFile(`${command.runId}-report.md`, new TextEncoder().encode(report.markdown)) }; break
+      }
+      case 'exportArtifact': {
+        const artifact = store.getArtifact(command.artifactId)
+        result = { path: await this.deps.saveFile(`${artifact.id}${artifact.mime.includes('javascript') ? '.test.mjs' : '.txt'}`, this.deps.evidence.get(artifact.sha256)) }; break
+      }
+      case 'startLogin': this.requireIdleAccount(command.runtime); result = { sessionId: accounts.start(command.runtime) }; break
+      case 'sendLoginInput': result = { sent: accounts.sendInput(command.sessionId, command.text) }; break
+      case 'cancelLogin': result = { cancelled: accounts.cancel(command.sessionId) }; break
+      case 'openLoginUrl': {
+        const url = accounts.loginUrl(command.sessionId)
+        if (url) await this.deps.openUrl(url)
+        result = { opened: !!url }; break
+      }
+      case 'logout': this.requireIdleAccount(command.runtime); result = await accounts.logout(command.runtime); break
+      default: throw new Error(`Unknown command ${(command as { type: string }).type}`)
     }
+    return result as CommandResults[C['type']]
   }
 }

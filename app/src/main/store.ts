@@ -44,7 +44,7 @@ import type {
   TestAccount,
   Verification,
 } from '../shared/domain'
-import { DEPTH_LIMITS, TERMINAL_TASK_STATUSES } from '../shared/domain'
+import { AREA_LABEL, DEPTH_LIMITS, FOCUS_LABEL, ROLES, TERMINAL_TASK_STATUSES } from '../shared/domain'
 import { type Envelope, type EventType, validateEvent } from '../shared/events'
 import { type RunTrigger, nextRunState, nextTaskStatus, triggerForTaskStatus } from '../shared/lifecycle'
 
@@ -309,7 +309,23 @@ export class QaStore {
   /** Idempotent start. The same key with the same contract returns the
    * original run; the same key with a different contract is a conflict. */
   startRun(input: StartRunInput): { run: Run; created: boolean } {
-    if (!input.idempotencyKey.trim()) throw new ConflictError('idempotency key is required')
+    if (typeof input.idempotencyKey !== 'string' || !input.idempotencyKey.trim()) throw new ConflictError('idempotency key is required')
+    if (!['white', 'black', 'both'].includes(input.mode)) throw new ConflictError('Choose a valid audit mode')
+    if (typeof input.allowCommands !== 'boolean') throw new ConflictError('Command permission must be explicit')
+    const audit = input.audit
+    if (!audit || !Object.hasOwn(DEPTH_LIMITS, audit.depth)) throw new ConflictError('Choose a valid audit depth')
+    if (!Array.isArray(audit.areas) || !audit.areas.length || audit.areas.some((x) => x !== 'whole_app' && !Object.hasOwn(AREA_LABEL, x))) throw new ConflictError('Choose a valid audit area')
+    if (!Array.isArray(audit.focus) || !audit.focus.length || audit.focus.some((x) => !Object.hasOwn(FOCUS_LABEL, x))) throw new ConflictError('Choose at least one audit focus')
+    if (!Array.isArray(audit.excludedPaths) || audit.excludedPaths.some((p) => typeof p !== 'string' || p.startsWith('/') || p.split(/[\\/]/).includes('..'))) throw new ConflictError('Excluded paths must stay within the project')
+    if (!Array.isArray(audit.accounts) || audit.accounts.some((a) => typeof a !== 'string')) throw new ConflictError('Invalid test account selection')
+    if (typeof audit.instructions !== 'string' || audit.instructions.length > 2000 || typeof audit.useKnowledge !== 'boolean') throw new ConflictError('Invalid audit instructions')
+    for (const role of ROLES) {
+      const profile = input.roster?.[role]
+      if (!profile || !['offline', 'claude', 'codex', 'omp'].includes(profile.runtime) || typeof profile.model !== 'string') throw new ConflictError(`Invalid worker for ${role}`)
+    }
+    const limits = input.limits ?? DEPTH_LIMITS[audit.depth]
+    if (!Number.isInteger(limits.maxRounds) || limits.maxRounds < 1 || limits.maxRounds > 5 || !Number.isInteger(limits.maxClaims) || limits.maxClaims < 1 || limits.maxClaims > 100) throw new ConflictError('Invalid run limits')
+    for (const role of ROLES) if (!Number.isFinite(limits.taskTimeoutSeconds[role]) || limits.taskTimeoutSeconds[role] <= 0 || limits.taskTimeoutSeconds[role] > 3600 || !Number.isInteger(limits.toolBudget[role]) || limits.toolBudget[role] < 1 || limits.toolBudget[role] > 1000) throw new ConflictError(`Invalid limits for ${role}`)
     return this.tx(() => {
       const target = this.getTarget(input.targetId)
       const snapshot = target.latestSnapshot
@@ -321,12 +337,13 @@ export class QaStore {
         } catch {
           throw new ConflictError('app URL is not a valid URL')
         }
+        if (parsed.username || parsed.password) throw new ConflictError('Do not put credentials in the test URL; use a named test account')
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new ConflictError('app URL must use http or https')
       }
       if (input.mode !== 'white' && !input.externalUrl && !input.allowCommands) {
         throw new ConflictError('Testing the running app needs either permission to start it here or an authorized test URL')
       }
-      const known = new Set(this.listTestAccounts(target.id).map((a) => a.name))
+      const known = new Set(this.listTestAccounts(target.id).filter((a) => a.configured).map((a) => a.name))
       for (const name of input.audit.accounts) if (!known.has(name)) throw new ConflictError(`test account ${name} is not set up for ${target.name}`)
       const dna = this.currentDna()
       const contract: RunContract = {
@@ -391,6 +408,11 @@ export class QaStore {
     const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Row | undefined
     if (!row) throw new NotFoundError(`run ${id}`)
     return this.toRun(row)
+  }
+
+  activeRuns(): Run[] {
+    const rows = this.db.prepare("SELECT id FROM runs WHERE state IN ('queued', 'running', 'pause_requested', 'paused', 'cancel_requested')").all() as Row[]
+    return rows.map((row) => this.getRun(String(row.id)))
   }
 
   listRuns(limit = 200): Run[] {
@@ -910,6 +932,11 @@ export class QaStore {
       this.append(runId, report.taskId, 'report_written', { report_id: report.id, version: report.version, author })
       return report
     })
+  }
+
+  listReports(runId: string): ReportVersion[] {
+    const rows = this.db.prepare('SELECT * FROM reports WHERE run_id = ? ORDER BY version DESC').all(runId) as Row[]
+    return rows.map((r) => ({ id: String(r.id), runId: String(r.run_id), taskId: r.task_id ? String(r.task_id) : null, version: Number(r.version), author: String(r.author), markdown: String(r.markdown), createdAt: String(r.created_at) }))
   }
 
   latestReport(runId: string): ReportVersion | null {

@@ -1,190 +1,83 @@
-import { ChevronDown, ChevronRight, KeyRound, Lock, Server } from 'lucide-react'
 import { useState } from 'react'
-import type { CaseDef } from '../../../shared/domain'
-import { Empty } from '../components/ui'
-import { useQuery } from '../lib/api'
-import { formatDateTime } from '../lib/format'
+import { Icon } from '../components/icons'
+import { Badge, Empty, ErrorBox, Loading, Metric, Modal, PageHead, useToast } from '../components/ui'
+import { command, useQuery } from '../lib/api'
+import { formatDateTime, shortId } from '../lib/format'
+import { navigate } from '../lib/router'
+import { useLive } from '../lib/stream'
 
 export function ProjectsScreen() {
-  const overview = useQuery('overview', undefined)
-  const data = overview.data
+  const live = useLive()
+  const projects = useQuery('overview', undefined, live.version)
+  const runs = useQuery('listRuns', undefined, live.version)
+  const [importing, setImporting] = useState(false)
+  const [url, setUrl] = useState('')
+  const [ref, setRef] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const toast = useToast()
+  const allRuns = runs.data ?? []
 
-  return (
-    <>
-      <div className="page-head">
-        <div>
-          <div className="eyebrow">Applications under test</div>
-          <h1 className="h-display" style={{ marginTop: 8 }}>
-            Projects
-          </h1>
-          <p className="lede">Each environment is a policy: where agents may go, what they may change, and which credentials exist. Secret values never reach this screen.</p>
-        </div>
-      </div>
+  async function load(kind: 'github' | 'zip') {
+    setBusy(true)
+    setError(null)
+    try {
+      const result = kind === 'github'
+        ? await command({ type: 'importGithub', url, ref: ref.trim() || null })
+        : await command({ type: 'chooseZip' })
+      if (result.targetId) {
+        setImporting(false)
+        projects.refetch()
+        toast('Project imported and scanned')
+        navigate(`/setup/${result.targetId}`)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
 
-      {data && data.projects.length === 0 ? (
-        <div className="frame">
-          <Empty title="No projects" />
-        </div>
-      ) : null}
-
-      {data?.projects.map((project) => {
-        const envs = data.environments.filter((e) => e.projectId === project.id)
-        const suites = data.suites.filter((s) => s.projectId === project.id)
-        return (
-          <section key={project.id} style={{ marginBottom: 40 }}>
-            <div className="frame frame--pad" style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-              <div style={{ flex: 1 }}>
-                <h2 className="h-display" style={{ fontSize: '2rem' }}>
-                  {project.name}
-                </h2>
-                <div className="row row--wrap" style={{ marginTop: 10 }}>
-                  <span className="chip chip--line mono">{project.appUrl}</span>
-                  <span className="chip chip--wash">owner {project.owner}</span>
-                  <span className="chip chip--wash">
-                    {envs.length} environment{envs.length === 1 ? '' : 's'} · {suites.length} suite{suites.length === 1 ? '' : 's'}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="section-head">
-              <h3 className="h-section">Environments</h3>
-            </div>
-            <div className="grid-2">
-              {envs.map((env) => (
-                <div key={env.id} className="frame frame--pad">
-                  <div className="row">
-                    <Server size={18} />
-                    <h4 className="h-card">{env.name}</h4>
-                    <span className="spacer" />
-                    <span className={`chip ${env.allowMutatingMethods ? 'chip--accent' : ''}`}>
-                      {env.allowMutatingMethods ? 'Writes allowed' : 'Read-only'}
-                    </span>
-                  </div>
-                  <dl className="kv" style={{ marginTop: 16 }}>
-                    <dt>Base URL</dt>
-                    <dd className="mono">{env.baseUrl}</dd>
-                    <dt>Allowed origins</dt>
-                    <dd className="row row--wrap" style={{ gap: 6 }}>
-                      {env.allowedOrigins.map((o) => (
-                        <span key={o} className="chip chip--line mono">
-                          {o}
-                        </span>
-                      ))}
-                    </dd>
-                    <dt>Test data</dt>
-                    <dd>{env.testDataPolicy}</dd>
-                    <dt>Reset</dt>
-                    <dd>{env.resetInstructions}</dd>
-                    <dt>Concurrency</dt>
-                    <dd className="num">{env.concurrencyLimit} worker</dd>
-                    <dt>Credentials</dt>
-                    <dd className="stack" style={{ gap: 6 }}>
-                      {env.secretRefs.length === 0 ? <span className="faint">None</span> : null}
-                      {env.secretRefs.map((s) => (
-                        <span key={s.name} className="row" style={{ gap: 8 }}>
-                          <KeyRound size={14} />
-                          <span className="mono">{s.name}</span>
-                          <span className={`chip ${s.configured ? 'chip--wash' : 'chip--error'}`}>
-                            <Lock size={12} />
-                            {s.configured ? 'reference configured' : 'missing'}
-                          </span>
-                        </span>
-                      ))}
-                    </dd>
-                  </dl>
-                </div>
-              ))}
-            </div>
-
-            <div className="section-head">
-              <h3 className="h-section">Suites</h3>
-            </div>
-            <div className="stack">
-              {suites.map((suite) => (
-                <div key={suite.id} className="frame frame--pad">
-                  <div className="row">
-                    <h4 className="h-card">{suite.name}</h4>
-                    <span className="spacer" />
-                    <span className="faint" style={{ fontSize: '0.84rem' }}>
-                      versions are immutable; edits create a new version
-                    </span>
-                  </div>
-                  {suite.versions.map((v, i) => (
-                    <div key={v.id} style={{ marginTop: 16 }}>
-                      <div className="row row--wrap">
-                        <span className={`chip ${i === 0 ? '' : 'chip--line'}`}>v{v.version}</span>
-                        <span className="chip chip--line mono">{v.sourceRevision}</span>
-                        <span className="faint" style={{ fontSize: '0.84rem' }}>
-                          {v.cases.length} cases · {formatDateTime(v.createdAt)}
-                        </span>
-                      </div>
-                      {i === 0 ? (
-                        <div className="stack" style={{ gap: 8, marginTop: 12 }}>
-                          {v.cases.map((c) => (
-                            <CaseRow key={c.id} testCase={c} />
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              ))}
-            </div>
-          </section>
-        )
-      })}
-    </>
-  )
-}
-
-function CaseRow({ testCase }: { testCase: CaseDef }) {
-  const [open, setOpen] = useState(false)
-  return (
-    <div style={{ border: '1px solid var(--line)', borderRadius: 12 }}>
-      <button
-        onClick={() => setOpen((o) => !o)}
-        style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '12px 14px', border: 0, background: 'transparent', cursor: 'pointer', textAlign: 'left' }}
-      >
-        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-        <strong>{testCase.title}</strong>
-        <span className="faint mono" style={{ fontSize: '0.78rem' }}>
-          {testCase.id}
-        </span>
-        <span className="spacer" />
-        {testCase.tags.map((t) => (
-          <span key={t} className="chip chip--wash">
-            {t}
-          </span>
-        ))}
-      </button>
-      {open ? (
-        <div style={{ padding: '0 16px 16px 40px' }} className="drop">
-          <div className="muted" style={{ marginBottom: 10 }}>
-            {testCase.preconditions}
-          </div>
-          <div className="eyebrow" style={{ marginBottom: 6 }}>
-            Steps
-          </div>
-          <ol style={{ margin: '0 0 12px', paddingLeft: 18 }}>
-            {testCase.steps.map((s) => (
-              <li key={s.id} style={{ marginBottom: 4 }}>
-                {s.title} {s.request ? <span className="mono faint">· {s.request.method} {s.request.url}</span> : null}
-              </li>
-            ))}
-          </ol>
-          <div className="eyebrow" style={{ marginBottom: 6 }}>
-            Assertions
-          </div>
-          <ul style={{ margin: 0, paddingLeft: 18 }}>
-            {testCase.assertions.map((a) => (
-              <li key={a.id} style={{ marginBottom: 4 }}>
-                {a.description} <span className="mono faint">· {a.kind}{a.path ? ` ${a.path}` : ''} = {JSON.stringify(a.expected)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+  return <>
+    <PageHead eyebrow="Projects" title="Your next audit starts here." description="Import an app. Set the scope. Follow every claim through challenge and proof."
+      action={<button className="btn btn--primary" onClick={() => setImporting(true)}><Icon name="plus"/>Import project</button>}/>
+    <div className="workspace-stats">
+      <Metric value={projects.data?.targets.length ?? 0} label="Projects"/>
+      <Metric value={allRuns.length} label="Audits"/>
+      <Metric value={allRuns.reduce((n, r) => n + (r.summary?.confirmed ?? 0), 0)} label="Host-confirmed findings"/>
+      <div className="workspace-stats__note"><Icon name="thinker" size={36}/><p>Five workers.<br/>Every finding challenged.</p></div>
     </div>
-  )
+    <ErrorBox error={projects.error ?? runs.error}/>
+    <div className="section-head"><h2>Projects</h2><span className="muted">Snapshots stored on this Mac</span></div>
+    {projects.loading && !projects.data ? <Loading/> : <div className="panel table-wrap">
+      <table className="projects-table"><thead><tr><th>Project</th><th>Technology</th><th>Snapshot</th><th>Last audit</th><th/></tr></thead>
+        <tbody>{projects.data?.targets.map((target) => {
+          const snapshot = target.latestSnapshot
+          const last = allRuns.find((r) => r.contract.targetId === target.id)
+          return <tr key={target.id}>
+            <td><div className="project-name"><Icon name={target.source.kind === 'sample' ? 'builder' : 'projects'} size={34}/><div><strong>{target.name}</strong><small className="table-sub">{target.source.kind === 'sample' ? 'Bundled sample with known defects' : target.source.kind === 'github' ? target.source.url : target.source.fileName}</small></div></div></td>
+            <td>{snapshot?.stack.languages.slice(0, 2).map((l) => l.name).join(', ') || 'Source'}<small className="table-sub">{snapshot?.stack.frameworks.slice(0, 2).join(', ') || `${snapshot?.fileCount ?? 0} files`}</small></td>
+            <td title={snapshot?.commitSha ?? snapshot?.contentHash}><span className="mono">{(snapshot?.commitSha ?? snapshot?.contentHash)?.slice(0, 10) ?? '—'}</span><small className="table-sub">{snapshot?.stack.routes.length ?? 0} routes / {snapshot?.stack.tests.files ?? 0} tests</small></td>
+            <td>{last ? <><Badge status={last.state}/><small className="table-sub">{last.contract.allowCommands ? 'Local commands allowed' : 'Commands off'}</small></> : <span className="muted">Ready</span>}</td>
+            <td><a className="text-btn" href={`#/setup/${target.id}`}>Set up audit <Icon name="arrow" size={16}/></a></td>
+          </tr>
+        })}</tbody>
+      </table>
+      {!projects.data?.targets.length && <Empty title="Import your first project.">GitHub repositories and ZIP source archives are supported.</Empty>}
+    </div>}
+    <button className="import-row" onClick={() => setImporting(true)}><Icon name="plus"/><strong>Add another project</strong><span>GitHub repository or ZIP archive</span><Icon name="arrow"/></button>
+    <div className="section-head"><h2>Recent audits</h2><a className="text-btn" href="#/arena">Open arena <Icon name="arrow" size={16}/></a></div>
+    <div className="panel">{allRuns.length ? <div className="table-wrap"><table><thead><tr><th>Project</th><th>Run</th><th>Status</th><th>Host confirmed</th><th>Started</th><th/></tr></thead><tbody>{allRuns.slice(0, 5).map((r) => <tr key={r.id}>
+      <td><strong>{r.contract.targetName}</strong></td><td>{shortId(r.id)}</td><td><Badge status={r.state}/></td><td>{r.summary?.confirmed ?? 0}</td><td className="muted">{formatDateTime(r.createdAt)}</td><td><a className="icon-btn" href={`#/arena/${r.id}`} aria-label={`Open audit ${shortId(r.id)}`}><Icon name="arrow"/></a></td>
+    </tr>)}</tbody></table></div> : <Empty title="The arena is ready.">Try the sample shop or import your own source.</Empty>}</div>
+    {importing && <Modal title="Import a project" onClose={() => { if (!busy) setImporting(false) }}>
+      <p className="muted">The source is copied into a local snapshot and scanned before anything runs.</p><ErrorBox error={error}/>
+      <form onSubmit={(e) => { e.preventDefault(); void load('github') }}>
+        <label className="field">GitHub repository<input autoFocus placeholder="https://github.com/owner/repository" value={url} onChange={(e) => setUrl(e.target.value)} required/></label>
+        <label className="field">Branch, tag, or commit <span className="faint">optional</span><input placeholder="Default branch" value={ref} onChange={(e) => setRef(e.target.value)}/></label>
+        <button className="btn btn--primary full" disabled={busy}>{busy ? 'Importing…' : 'Import from GitHub'}<Icon name="arrow" size={18}/></button>
+      </form>
+      <div className="divider-label">or use a local archive</div><button className="btn full" disabled={busy} onClick={() => void load('zip')}><Icon name="folder"/>Choose ZIP file</button>
+    </Modal>}
+  </>
 }
