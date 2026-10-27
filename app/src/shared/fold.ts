@@ -10,7 +10,7 @@
  * no-op. Total: an event type with no visual mapping still advances `seq`.
  */
 
-import type { ClaimStatus, Phase, ReplayOutcome, Role, RunState, RuntimeId, Stance, TaskStatus, TestMode } from './domain'
+import type { AuditConfig, ClaimStatus, EvidenceOutcome, Phase, Role, RunState, RuntimeId, Stance, TaskStatus, TestMode } from './domain'
 import { PHASES, ROLES } from './domain'
 import type { Envelope } from './events'
 import { claimTruth } from './verdict'
@@ -33,13 +33,24 @@ export interface TaskView {
   lastTool: string | null
   messages: string[]
   blockedReason: string | null
+  usage: Record<string, unknown> | null
 }
 
 export interface ChallengeView {
   taskId: string | null
   runtime: RuntimeId | null
+  round: number
   stance: Stance
   reasoning: string
+}
+
+export interface EvidenceView {
+  round: number
+  outcome: EvidenceOutcome
+  expected: string | null
+  actual: string | null
+  detail: string
+  artifactId: string | null
 }
 
 export interface ClaimView {
@@ -48,14 +59,19 @@ export interface ClaimView {
   role: Role | null
   runtime: RuntimeId | null
   title: string
+  category: string
   severity: string
   area: string
   location: string | null
   hasRepro: boolean
   status: ClaimStatus
   verdictReason: string | null
+  round: number
+  revisions: { round: number; action: string }[]
+  withdrawn: boolean
   challenges: ChallengeView[]
-  replay: { outcome: ReplayOutcome; detail: string } | null
+  evidence: EvidenceView[]
+  regressionTest: { artifactId: string; failsNow: boolean } | null
   review: { decision: 'accepted' | 'rejected'; reason: string; reviewer: string } | null
   seq: number
 }
@@ -85,6 +101,7 @@ export interface RunView {
   state: RunState | 'unknown'
   targetName: string | null
   mode: TestMode | null
+  audit: AuditConfig | null
   roster: Partial<Record<Role, { runtime: RuntimeId; model: string }>>
   dnaVersion: number | null
   initiator: string | null
@@ -93,6 +110,7 @@ export interface RunView {
   endedAt: string | null
   terminalReason: string | null
   cancelRequestedBy: string | null
+  round: number
   phases: Record<Phase, { status: PhaseStatus; note: string | null }>
   taskOrder: string[]
   tasks: Record<string, TaskView>
@@ -101,7 +119,7 @@ export interface RunView {
   claims: Record<string, ClaimView>
   artifacts: Record<string, ArtifactView>
   app: { url: string; command: string; running: boolean } | null
-  surface: number
+  surface: { kind: string; name: string }[]
   reports: { reportId: string; version: number; author: string; seq: number }[]
   ruleChanges: RuleChangeView[]
 }
@@ -115,6 +133,7 @@ export const initialRunView: RunView = Object.freeze({
   state: 'unknown',
   targetName: null,
   mode: null,
+  audit: null,
   roster: {},
   dnaVersion: null,
   initiator: null,
@@ -123,6 +142,7 @@ export const initialRunView: RunView = Object.freeze({
   endedAt: null,
   terminalReason: null,
   cancelRequestedBy: null,
+  round: 0,
   phases: emptyPhases(),
   taskOrder: [],
   tasks: {},
@@ -131,7 +151,7 @@ export const initialRunView: RunView = Object.freeze({
   claims: {},
   artifacts: {},
   app: null,
-  surface: 0,
+  surface: [],
   reports: [],
   ruleChanges: [],
 }) as RunView
@@ -169,6 +189,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         state: 'queued',
         targetName: str(p.target_name),
         mode: str(p.mode) as TestMode,
+        audit: (p.audit && typeof p.audit === 'object' ? p.audit : null) as AuditConfig | null,
         roster,
         dnaVersion: Number(p.dna_version) || null,
         initiator: str(p.initiator),
@@ -212,6 +233,9 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
       next = { ...next, phases: { ...next.phases, [phase]: { status: str(p.status) as PhaseStatus, note: strOrNull(p.note) } } }
       break
     }
+    case 'round_started':
+      next = { ...next, round: Number(p.round) || next.round }
+      break
     case 'task_started': {
       if (event.taskId === null) break
       const task: TaskView = {
@@ -230,6 +254,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         lastTool: null,
         messages: [],
         blockedReason: null,
+        usage: null,
       }
       next = {
         ...next,
@@ -240,7 +265,13 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
       break
     }
     case 'task_finished':
-      next = withTask(next, event.taskId, (t) => ({ ...t, status: str(p.status) as TaskStatus, reason: strOrNull(p.reason), endedAt: event.ts }))
+      next = withTask(next, event.taskId, (t) => ({
+        ...t,
+        status: str(p.status) as TaskStatus,
+        reason: strOrNull(p.reason),
+        endedAt: event.ts,
+        usage: p.usage && typeof p.usage === 'object' ? (p.usage as Record<string, unknown>) : t.usage,
+      }))
       if (next.activeTaskId === event.taskId) next = { ...next, activeTaskId: null }
       break
     case 'worker_heartbeat':
@@ -267,15 +298,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         ...next,
         artifacts: {
           ...next.artifacts,
-          [artifactId]: {
-            artifactId,
-            taskId: event.taskId,
-            label: str(p.label),
-            mime: str(p.mime),
-            bytes: Number(p.bytes) || 0,
-            sha256: str(p.sha256),
-            seq: event.seq,
-          },
+          [artifactId]: { artifactId, taskId: event.taskId, label: str(p.label), mime: str(p.mime), bytes: Number(p.bytes) || 0, sha256: str(p.sha256), seq: event.seq },
         },
       }
       break
@@ -287,7 +310,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
       if (next.app) next = { ...next, app: { ...next.app, running: false } }
       break
     case 'surface_noted':
-      next = { ...next, surface: next.surface + 1 }
+      next = { ...next, surface: [...next.surface, { kind: str(p.kind), name: str(p.name) }] }
       break
     case 'claim_proposed': {
       const claimId = str(p.claim_id)
@@ -298,33 +321,70 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
         role: proposer?.role ?? null,
         runtime: proposer?.runtime ?? null,
         title: str(p.title),
+        category: str(p.category),
         severity: str(p.severity),
         area: str(p.area),
         location: strOrNull(p.location),
         hasRepro: p.has_repro === true,
-        status: 'open',
+        status: 'candidate',
         verdictReason: null,
+        round: 1,
+        revisions: [],
+        withdrawn: false,
         challenges: [],
-        replay: null,
+        evidence: [],
+        regressionTest: null,
         review: null,
         seq: event.seq,
       }
       next = { ...next, claims: { ...next.claims, [claimId]: claim }, claimOrder: [...next.claimOrder, claimId] }
       break
     }
+    case 'claim_revised': {
+      const action = str(p.action)
+      const round = Number(p.round) || 1
+      next = withClaim(next, str(p.claim_id), (c) => ({
+        ...c,
+        round,
+        revisions: [...c.revisions, { round, action }],
+        withdrawn: c.withdrawn || action === 'withdraw',
+        hasRepro: action === 'amend' && p.has_repro === true ? true : c.hasRepro,
+        status: action === 'amend' ? 'candidate' : c.status,
+      }))
+      break
+    }
     case 'challenge_recorded': {
       const challenger = event.taskId ? next.tasks[event.taskId] : undefined
       next = withClaim(next, str(p.claim_id), (c) => ({
         ...c,
-        challenges: [...c.challenges, { taskId: event.taskId, runtime: challenger?.runtime ?? null, stance: str(p.stance) as Stance, reasoning: str(p.reasoning) }],
+        challenges: [
+          ...c.challenges,
+          { taskId: event.taskId, runtime: challenger?.runtime ?? null, round: Number(p.round) || 1, stance: str(p.stance) as Stance, reasoning: str(p.reasoning) },
+        ],
       }))
       break
     }
-    case 'replay_finished':
-      next = withClaim(next, str(p.claim_id), (c) => ({ ...c, replay: { outcome: str(p.outcome) as ReplayOutcome, detail: str(p.detail) } }))
+    case 'evidence_checked':
+      next = withClaim(next, str(p.claim_id), (c) => ({
+        ...c,
+        evidence: [
+          ...c.evidence,
+          {
+            round: Number(p.round) || 1,
+            outcome: str(p.outcome) as EvidenceOutcome,
+            expected: strOrNull(p.expected),
+            actual: strOrNull(p.actual),
+            detail: str(p.detail),
+            artifactId: strOrNull(p.artifact_id),
+          },
+        ],
+      }))
       break
     case 'claim_verdict':
       next = withClaim(next, str(p.claim_id), (c) => ({ ...c, status: str(p.status) as ClaimStatus, verdictReason: str(p.reason) }))
+      break
+    case 'regression_test_written':
+      next = withClaim(next, str(p.claim_id), (c) => ({ ...c, regressionTest: { artifactId: str(p.artifact_id), failsNow: p.fails_now === true } }))
       break
     case 'claim_reviewed':
       next = withClaim(next, str(p.claim_id), (c) => ({
@@ -339,10 +399,7 @@ export function applyRunEvent(state: RunView, event: Envelope): RunView {
       const proposer = event.taskId ? next.tasks[event.taskId] : undefined
       next = {
         ...next,
-        ruleChanges: [
-          ...next.ruleChanges,
-          { changeId: str(p.change_id), op: str(p.op), role: str(p.role), text: str(p.text), status: 'proposed', runtime: proposer?.runtime ?? null },
-        ],
+        ruleChanges: [...next.ruleChanges, { changeId: str(p.change_id), op: str(p.op), role: str(p.role), text: str(p.text), status: 'proposed', runtime: proposer?.runtime ?? null }],
       }
       break
     }
@@ -367,23 +424,49 @@ export function foldRun(events: readonly Envelope[], upToSeq = Number.POSITIVE_I
   return state
 }
 
-export interface ClaimCounts {
-  claims: number
-  confirmed: number
-  refuted: number
-  disputed: number
-  unverified: number
-  open: number
+/** A claim's status after a person's decision, if any. */
+export function effectiveStatus(c: Pick<ClaimView, 'status' | 'review'>): ClaimStatus {
+  if (c.review?.decision === 'accepted') return 'confirmed'
+  if (c.review?.decision === 'rejected') return 'rejected'
+  return c.status
 }
 
-export function claimCounts(view: RunView): ClaimCounts {
-  const counts: ClaimCounts = { claims: 0, confirmed: 0, refuted: 0, disputed: 0, unverified: 0, open: 0 }
+export interface ArenaMetrics {
+  claims: number
+  confirmed: number
+  rejected: number
+  inconclusive: number
+  needsReview: number
+  candidate: number
+  /** Confirmed over everything settled either way. Null until something settles. */
+  precision: number | null
+  /** Share of claims the host checked with a replay or a code citation. */
+  verificationCoverage: number | null
+  /** Unsupported findings the arena stopped from reaching the report. */
+  falsePositivesCaught: number
+  regressionTests: number
+}
+
+export function arenaMetrics(view: RunView): ArenaMetrics {
+  const m: ArenaMetrics = { claims: 0, confirmed: 0, rejected: 0, inconclusive: 0, needsReview: 0, candidate: 0, precision: null, verificationCoverage: null, falsePositivesCaught: 0, regressionTests: 0 }
+  let checked = 0
   for (const id of view.claimOrder) {
     const c = view.claims[id]
-    counts.claims += 1
-    counts[c.status] += 1
+    m.claims += 1
+    const status = effectiveStatus(c)
+    if (status === 'confirmed') m.confirmed += 1
+    else if (status === 'rejected') m.rejected += 1
+    else if (status === 'inconclusive') m.inconclusive += 1
+    else if (status === 'needs_review') m.needsReview += 1
+    else m.candidate += 1
+    if (c.evidence.some((e) => e.outcome !== 'no_evidence' && e.outcome !== 'error')) checked += 1
+    if (c.regressionTest) m.regressionTests += 1
   }
-  return counts
+  const settled = m.confirmed + m.rejected
+  m.precision = settled > 0 ? m.confirmed / settled : null
+  m.verificationCoverage = m.claims > 0 ? checked / m.claims : null
+  m.falsePositivesCaught = m.rejected
+  return m
 }
 
 export interface ScoreLine {
@@ -398,7 +481,7 @@ export interface ScoreLine {
 }
 
 /** Arena score: claims that held up versus fell, and challenges that called
- * it right versus wrong once a claim is settled (by replay or by a person). */
+ * it right versus wrong once a claim is settled (by evidence or a person). */
 export function scoreboard(view: RunView): ScoreLine[] {
   const lines = new Map<string, ScoreLine>()
   const line = (runtime: RuntimeId, role: Role) => {
@@ -419,7 +502,10 @@ export function scoreboard(view: RunView): ScoreLine[] {
       if (truth === true) l.claimsHeld += 1
       if (truth === false) l.claimsFell += 1
     }
-    for (const ch of c.challenges) {
+    // Score each challenger on its latest stance for the claim.
+    const latest = new Map<string, ChallengeView>()
+    for (const ch of c.challenges) if (ch.taskId) latest.set(`${ch.runtime}`, ch)
+    for (const ch of latest.values()) {
       if (!ch.runtime || !ch.taskId) continue
       const role = view.tasks[ch.taskId]?.role ?? 'thinker'
       const l = line(ch.runtime, role)

@@ -93,12 +93,19 @@ const MIGRATIONS: string[] = [
     runtime TEXT NOT NULL,
     title TEXT NOT NULL,
     detail TEXT NOT NULL,
+    category TEXT NOT NULL,
     severity TEXT NOT NULL,
+    severity_rationale TEXT NOT NULL,
     area TEXT NOT NULL,
     location TEXT,
+    evidence_quote TEXT,
     reproduction TEXT,
+    suggested_fix TEXT,
     status TEXT NOT NULL,
     verdict_reason TEXT,
+    round INTEGER NOT NULL DEFAULT 1,
+    withdrawn INTEGER NOT NULL DEFAULT 0,
+    regression_artifact_id TEXT,
     created_at TEXT NOT NULL
   );
   CREATE TABLE challenges (
@@ -106,17 +113,38 @@ const MIGRATIONS: string[] = [
     claim_id TEXT NOT NULL REFERENCES claims(id),
     task_id TEXT NOT NULL REFERENCES tasks(id),
     runtime TEXT NOT NULL,
+    round INTEGER NOT NULL,
     stance TEXT NOT NULL,
     reasoning TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE (claim_id, task_id)
   );
-  CREATE TABLE replays (
-    claim_id TEXT PRIMARY KEY REFERENCES claims(id),
+  CREATE TABLE verifications (
+    id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL REFERENCES claims(id),
+    round INTEGER NOT NULL,
     outcome TEXT NOT NULL,
+    expected TEXT,
+    actual TEXT,
     detail TEXT NOT NULL,
     artifact_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    UNIQUE (claim_id, round)
+  );
+  CREATE TABLE test_accounts (
+    target_id TEXT NOT NULL REFERENCES targets(id),
+    name TEXT NOT NULL,
+    header_name TEXT NOT NULL,
+    header_value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (target_id, name)
+  );
+  CREATE TABLE ground_truth (
+    target_id TEXT NOT NULL REFERENCES targets(id),
+    bug_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    match TEXT NOT NULL,
+    PRIMARY KEY (target_id, bug_id)
   );
   CREATE TABLE claim_reviews (
     id TEXT PRIMARY KEY,

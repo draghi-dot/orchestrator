@@ -1,7 +1,7 @@
 /**
- * The QA DNA control-plane store: imported apps and their snapshots, run
- * contracts, tasks, the durable event log, evidence metadata, claims and
- * their challenges and replays, reports, and the versioned DNA.
+ * The QA Arena control-plane store: imported apps and their snapshots, run
+ * contracts, tasks, the durable event log, evidence metadata, claims with
+ * their challenges and verifications, reports, and the versioned DNA.
  *
  * Every state change and the event that records it commit in ONE
  * transaction. Worker writes go through a `Lease`; a lease whose generation
@@ -13,15 +13,16 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import type {
   Artifact,
+  AuditConfig,
+  Category,
   Challenge,
   Claim,
   ClaimReview,
   ClaimStatus,
   DnaRule,
   DnaVersion,
+  EvidenceOutcome,
   Phase,
-  Replay,
-  ReplayOutcome,
   ReportVersion,
   Reproduction,
   ReviewDecision,
@@ -40,8 +41,10 @@ import type {
   TargetSource,
   Task,
   TaskStatus,
+  TestAccount,
+  Verification,
 } from '../shared/domain'
-import { DEFAULT_LIMITS, TERMINAL_TASK_STATUSES } from '../shared/domain'
+import { DEPTH_LIMITS, TERMINAL_TASK_STATUSES } from '../shared/domain'
 import { type Envelope, type EventType, validateEvent } from '../shared/events'
 import { type RunTrigger, nextRunState, nextTaskStatus, triggerForTaskStatus } from '../shared/lifecycle'
 
@@ -81,6 +84,7 @@ export interface StartRunInput {
   mode: RunContract['mode']
   externalUrl: string | null
   allowCommands: boolean
+  audit: AuditConfig
   roster: RunContract['roster']
   initiator: string
   limits?: RunContract['limits']
@@ -319,19 +323,26 @@ export class QaStore {
         }
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new ConflictError('app URL must use http or https')
       }
+      if (input.mode !== 'white' && !input.externalUrl && !input.allowCommands) {
+        throw new ConflictError('Testing the running app needs either permission to start it here or an authorized test URL')
+      }
+      const known = new Set(this.listTestAccounts(target.id).map((a) => a.name))
+      for (const name of input.audit.accounts) if (!known.has(name)) throw new ConflictError(`test account ${name} is not set up for ${target.name}`)
       const dna = this.currentDna()
       const contract: RunContract = {
         targetId: target.id,
         targetName: target.name,
         snapshotId: snapshot.id,
         snapshotHash: snapshot.contentHash,
+        commitSha: snapshot.commitSha,
         mode: input.mode,
         externalUrl: input.externalUrl ? new URL(input.externalUrl).origin : null,
         allowCommands: input.allowCommands,
+        audit: input.audit,
         roster: input.roster,
         dnaVersionId: dna.id,
         initiator: input.initiator,
-        limits: input.limits ?? DEFAULT_LIMITS,
+        limits: input.limits ?? DEPTH_LIMITS[input.audit.depth],
       }
       const contractHash = hashContract(contract)
       const existing = this.db.prepare('SELECT * FROM runs WHERE idempotency_key = ?').get(input.idempotencyKey) as Row | undefined
@@ -348,6 +359,7 @@ export class QaStore {
       this.append(id, null, 'run_created', {
         target_name: target.name,
         mode: contract.mode,
+        audit: contract.audit,
         roster: contract.roster,
         initiator: input.initiator,
         dna_version: dna.version,
@@ -572,44 +584,104 @@ export class QaStore {
 
   proposeClaim(
     lease: Lease,
-    input: { title: string; detail: string; severity: Severity; area: 'white' | 'black'; location: string | null; reproduction: Reproduction | null },
+    input: {
+      title: string
+      detail: string
+      category: Category
+      severity: Severity
+      severityRationale: string
+      area: 'white' | 'black'
+      location: string | null
+      evidenceQuote: string | null
+      reproduction: Reproduction | null
+      suggestedFix: string | null
+    },
     maxClaims: number,
   ): Claim {
     return this.tx(() => {
       this.assertOwner(lease)
       const count = this.db.prepare('SELECT COUNT(*) AS n FROM claims WHERE run_id = ?').get(lease.runId) as Row
-      if (Number(count.n) >= maxClaims) throw new ConflictError(`this run already has the maximum of ${maxClaims} claims`)
+      if (Number(count.n) >= maxClaims) throw new ConflictError(`this run already has the maximum of ${maxClaims} findings`)
       const claim: Claim = {
         id: this.newId('claim'),
         runId: lease.runId,
         taskId: lease.taskId,
         role: lease.role,
         runtime: lease.runtime,
-        title: input.title,
-        detail: input.detail,
-        severity: input.severity,
-        area: input.area,
-        location: input.location,
-        reproduction: input.reproduction,
-        status: 'open',
+        ...input,
+        status: 'candidate',
         verdictReason: null,
+        round: 1,
+        withdrawn: false,
+        regressionTestArtifactId: null,
         createdAt: this.now(),
       }
       this.db
         .prepare(
-          `INSERT INTO claims (id, run_id, task_id, role, runtime, title, detail, severity, area, location, reproduction, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+          `INSERT INTO claims (id, run_id, task_id, role, runtime, title, detail, category, severity, severity_rationale, area, location,
+             evidence_quote, reproduction, suggested_fix, status, round, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'candidate', 1, ?)`,
         )
-        .run(claim.id, claim.runId, claim.taskId, claim.role, claim.runtime, claim.title, claim.detail, claim.severity, claim.area, claim.location, claim.reproduction ? JSON.stringify(claim.reproduction) : null, claim.createdAt)
+        .run(
+          claim.id,
+          claim.runId,
+          claim.taskId,
+          claim.role,
+          claim.runtime,
+          claim.title,
+          claim.detail,
+          claim.category,
+          claim.severity,
+          claim.severityRationale,
+          claim.area,
+          claim.location,
+          claim.evidenceQuote,
+          claim.reproduction ? JSON.stringify(claim.reproduction) : null,
+          claim.suggestedFix,
+          claim.createdAt,
+        )
       this.append(lease.runId, lease.taskId, 'claim_proposed', {
         claim_id: claim.id,
         title: claim.title,
+        category: claim.category,
         severity: claim.severity,
         area: claim.area,
         location: claim.location,
         has_repro: claim.reproduction !== null,
       })
       return claim
+    })
+  }
+
+  /** The proposer answers a challenge: amend the evidence, or withdraw. */
+  reviseClaim(
+    lease: Lease,
+    input: { claimId: string; action: 'amend' | 'withdraw'; round: number; detail?: string; location?: string | null; evidenceQuote?: string | null; reproduction?: Reproduction | null },
+  ): Claim {
+    return this.tx(() => {
+      this.assertOwner(lease)
+      const claim = this.getClaim(input.claimId)
+      if (claim.runId !== lease.runId) throw new ConflictError('that finding belongs to a different run')
+      if (claim.withdrawn) throw new ConflictError('that finding was already withdrawn')
+      if (input.action === 'withdraw') {
+        this.db.prepare("UPDATE claims SET withdrawn = 1, round = ?, status = 'rejected', verdict_reason = ? WHERE id = ?").run(input.round, 'Withdrawn by its author after the challenge.', claim.id)
+        this.append(lease.runId, lease.taskId, 'claim_revised', { claim_id: claim.id, action: 'withdraw', round: input.round })
+        this.append(lease.runId, null, 'claim_verdict', { claim_id: claim.id, status: 'rejected', reason: 'Withdrawn by its author after the challenge.' })
+      } else {
+        this.db
+          .prepare("UPDATE claims SET detail = ?, location = ?, evidence_quote = ?, reproduction = ?, round = ?, status = 'candidate', verdict_reason = NULL WHERE id = ?")
+          .run(
+            input.detail ?? claim.detail,
+            input.location === undefined ? claim.location : input.location,
+            input.evidenceQuote === undefined ? claim.evidenceQuote : input.evidenceQuote,
+            input.reproduction === undefined ? (claim.reproduction ? JSON.stringify(claim.reproduction) : null) : input.reproduction ? JSON.stringify(input.reproduction) : null,
+            input.round,
+            claim.id,
+          )
+        const updated = this.getClaim(claim.id)
+        this.append(lease.runId, lease.taskId, 'claim_revised', { claim_id: claim.id, action: 'amend', round: input.round, has_repro: updated.reproduction !== null })
+      }
+      return this.getClaim(claim.id)
     })
   }
 
@@ -622,19 +694,26 @@ export class QaStore {
       runtime: r.runtime as RuntimeId,
       title: String(r.title),
       detail: String(r.detail),
+      category: r.category as Category,
       severity: r.severity as Severity,
+      severityRationale: String(r.severity_rationale),
       area: r.area as 'white' | 'black',
       location: optStr(r.location),
+      evidenceQuote: optStr(r.evidence_quote),
       reproduction: r.reproduction ? json<Reproduction>(r.reproduction) : null,
+      suggestedFix: optStr(r.suggested_fix),
       status: r.status as ClaimStatus,
       verdictReason: optStr(r.verdict_reason),
+      round: Number(r.round),
+      withdrawn: Number(r.withdrawn) === 1,
+      regressionTestArtifactId: optStr(r.regression_artifact_id),
       createdAt: String(r.created_at),
     }
   }
 
   getClaim(id: string): Claim {
     const row = this.db.prepare('SELECT * FROM claims WHERE id = ?').get(id) as Row | undefined
-    if (!row) throw new NotFoundError(`claim ${id}`)
+    if (!row) throw new NotFoundError(`finding ${id}`)
     return this.toClaim(row)
   }
 
@@ -642,58 +721,83 @@ export class QaStore {
     return (this.db.prepare('SELECT * FROM claims WHERE run_id = ? ORDER BY created_at, rowid').all(runId) as Row[]).map((r) => this.toClaim(r))
   }
 
-  recordChallenge(lease: Lease, input: { claimId: string; stance: Stance; reasoning: string }): Challenge {
+  listAllClaims(limit = 500): Claim[] {
+    return (this.db.prepare('SELECT * FROM claims ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit) as Row[]).map((r) => this.toClaim(r))
+  }
+
+  recordChallenge(lease: Lease, input: { claimId: string; stance: Stance; reasoning: string; round: number }): Challenge {
     return this.tx(() => {
       this.assertOwner(lease)
       const claim = this.getClaim(input.claimId)
-      if (claim.runId !== lease.runId) throw new ConflictError('that claim belongs to a different run')
-      if (claim.taskId === lease.taskId) throw new ConflictError('a worker cannot challenge its own claim')
+      if (claim.runId !== lease.runId) throw new ConflictError('that finding belongs to a different run')
+      if (claim.taskId === lease.taskId) throw new ConflictError('a worker cannot challenge its own finding')
+      if (claim.withdrawn) throw new ConflictError('that finding was withdrawn')
       const existing = this.db.prepare('SELECT id FROM challenges WHERE claim_id = ? AND task_id = ?').get(input.claimId, lease.taskId) as Row | undefined
-      if (existing) throw new ConflictError('this claim was already challenged in this task')
+      if (existing) throw new ConflictError('you already ruled on this finding in this round')
       const challenge: Challenge = {
         id: this.newId('chal'),
         claimId: input.claimId,
         taskId: lease.taskId,
         runtime: lease.runtime,
+        round: input.round,
         stance: input.stance,
         reasoning: input.reasoning,
         createdAt: this.now(),
       }
       this.db
-        .prepare('INSERT INTO challenges (id, claim_id, task_id, runtime, stance, reasoning, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(challenge.id, challenge.claimId, challenge.taskId, challenge.runtime, challenge.stance, challenge.reasoning, challenge.createdAt)
-      this.append(lease.runId, lease.taskId, 'challenge_recorded', { claim_id: input.claimId, stance: input.stance, reasoning: input.reasoning })
+        .prepare('INSERT INTO challenges (id, claim_id, task_id, runtime, round, stance, reasoning, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(challenge.id, challenge.claimId, challenge.taskId, challenge.runtime, challenge.round, challenge.stance, challenge.reasoning, challenge.createdAt)
+      this.append(lease.runId, lease.taskId, 'challenge_recorded', { claim_id: input.claimId, stance: input.stance, reasoning: input.reasoning, round: input.round })
       return challenge
     })
   }
 
   listChallenges(claimId: string): Challenge[] {
-    return (this.db.prepare('SELECT * FROM challenges WHERE claim_id = ? ORDER BY created_at, rowid').all(claimId) as Row[]).map((r) => ({
+    return (this.db.prepare('SELECT * FROM challenges WHERE claim_id = ? ORDER BY round, created_at, rowid').all(claimId) as Row[]).map((r) => ({
       id: String(r.id),
       claimId: String(r.claim_id),
       taskId: String(r.task_id),
       runtime: r.runtime as RuntimeId,
+      round: Number(r.round),
       stance: r.stance as Stance,
       reasoning: String(r.reasoning),
       createdAt: String(r.created_at),
     }))
   }
 
-  recordReplay(runId: string, input: { claimId: string; outcome: ReplayOutcome; detail: string; artifactId: string | null }): Replay {
+  recordVerification(runId: string, input: Omit<Verification, 'createdAt'>): Verification {
     return this.tx(() => {
-      const replay: Replay = { ...input, createdAt: this.now() }
+      const v: Verification = { ...input, createdAt: this.now() }
       this.db
-        .prepare('INSERT OR REPLACE INTO replays (claim_id, outcome, detail, artifact_id, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(replay.claimId, replay.outcome, replay.detail, replay.artifactId, replay.createdAt)
-      this.append(runId, null, 'replay_finished', { claim_id: input.claimId, outcome: input.outcome, detail: input.detail, artifact_id: input.artifactId })
-      return replay
+        .prepare(
+          `INSERT OR REPLACE INTO verifications (id, claim_id, round, outcome, expected, actual, detail, artifact_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(this.newId('ver'), v.claimId, v.round, v.outcome, v.expected, v.actual, v.detail, v.artifactId, v.createdAt)
+      this.append(runId, null, 'evidence_checked', {
+        claim_id: v.claimId,
+        round: v.round,
+        outcome: v.outcome,
+        expected: v.expected,
+        actual: v.actual,
+        detail: v.detail,
+        artifact_id: v.artifactId,
+      })
+      return v
     })
   }
 
-  getReplay(claimId: string): Replay | null {
-    const r = this.db.prepare('SELECT * FROM replays WHERE claim_id = ?').get(claimId) as Row | undefined
-    if (!r) return null
-    return { claimId: String(r.claim_id), outcome: r.outcome as ReplayOutcome, detail: String(r.detail), artifactId: optStr(r.artifact_id), createdAt: String(r.created_at) }
+  listVerifications(claimId: string): Verification[] {
+    return (this.db.prepare('SELECT * FROM verifications WHERE claim_id = ? ORDER BY round').all(claimId) as Row[]).map((r) => ({
+      claimId: String(r.claim_id),
+      round: Number(r.round),
+      outcome: r.outcome as EvidenceOutcome,
+      expected: optStr(r.expected),
+      actual: optStr(r.actual),
+      detail: String(r.detail),
+      artifactId: optStr(r.artifact_id),
+      createdAt: String(r.created_at),
+    }))
   }
 
   settleClaim(claimId: string, status: ClaimStatus, reason: string): Claim {
@@ -705,12 +809,20 @@ export class QaStore {
     })
   }
 
+  setRegressionTest(claimId: string, artifactId: string, failsNow: boolean): void {
+    this.tx(() => {
+      const claim = this.getClaim(claimId)
+      this.db.prepare('UPDATE claims SET regression_artifact_id = ? WHERE id = ?').run(artifactId, claimId)
+      this.append(claim.runId, null, 'regression_test_written', { claim_id: claimId, artifact_id: artifactId, fails_now: failsNow })
+    })
+  }
+
   reviewClaim(input: { claimId: string; decision: ReviewDecision; reason: string; reviewer: string }): ClaimReview {
     if (!input.reason.trim()) throw new ConflictError('a decision needs a reason')
     return this.tx(() => {
       const claim = this.getClaim(input.claimId)
-      if (claim.status !== 'disputed' && claim.status !== 'unverified') throw new ConflictError(`a ${claim.status} claim does not need a person to decide`)
-      if (this.getReview(claim.id)) throw new ConflictError('this claim was already decided')
+      if (claim.status !== 'needs_review' && claim.status !== 'inconclusive') throw new ConflictError(`a ${claim.status} finding does not need a person to decide`)
+      if (this.getReview(claim.id)) throw new ConflictError('this finding was already decided')
       const review: ClaimReview = { id: this.newId('rev'), claimId: claim.id, decision: input.decision, reason: input.reason.trim(), reviewer: input.reviewer, createdAt: this.now() }
       this.db
         .prepare('INSERT INTO claim_reviews (id, claim_id, decision, reason, reviewer, created_at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -726,12 +838,58 @@ export class QaStore {
     return { id: String(r.id), claimId: String(r.claim_id), decision: r.decision as ReviewDecision, reason: String(r.reason), reviewer: String(r.reviewer), createdAt: String(r.created_at) }
   }
 
+  // ------------------------------------------------------- test accounts
+
+  /** Credentials for a test account. The value is only ever read by the
+   * host when it sends a request; it never goes to the renderer or a model. */
+  setTestAccount(targetId: string, name: string, headerName: string, headerValue: string): void {
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(name)) throw new ConflictError('account names use letters, digits, - and _ only')
+    if (!/^[A-Za-z0-9-]{1,60}$/.test(headerName)) throw new ConflictError('that is not a valid header name')
+    this.db
+      .prepare('INSERT OR REPLACE INTO test_accounts (target_id, name, header_name, header_value, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(targetId, name, headerName, headerValue, this.now())
+  }
+
+  removeTestAccount(targetId: string, name: string): void {
+    this.db.prepare('DELETE FROM test_accounts WHERE target_id = ? AND name = ?').run(targetId, name)
+  }
+
+  listTestAccounts(targetId: string): TestAccount[] {
+    return (this.db.prepare('SELECT name, header_name, header_value FROM test_accounts WHERE target_id = ? ORDER BY name').all(targetId) as Row[]).map((r) => ({
+      name: String(r.name),
+      headerName: String(r.header_name),
+      configured: String(r.header_value).length > 0,
+    }))
+  }
+
+  testAccountHeader(targetId: string, name: string): { name: string; value: string } | null {
+    const r = this.db.prepare('SELECT header_name, header_value FROM test_accounts WHERE target_id = ? AND name = ?').get(targetId, name) as Row | undefined
+    return r ? { name: String(r.header_name), value: String(r.header_value) } : null
+  }
+
+  // --------------------------------------------------------- ground truth
+
+  setGroundTruth(targetId: string, bugs: { id: string; title: string; match: string[] }[]): void {
+    this.tx(() => {
+      this.db.prepare('DELETE FROM ground_truth WHERE target_id = ?').run(targetId)
+      for (const b of bugs) this.db.prepare('INSERT INTO ground_truth (target_id, bug_id, title, match) VALUES (?, ?, ?, ?)').run(targetId, b.id, b.title, JSON.stringify(b.match))
+    })
+  }
+
+  listGroundTruth(targetId: string): { id: string; title: string; match: string[] }[] {
+    return (this.db.prepare('SELECT * FROM ground_truth WHERE target_id = ? ORDER BY bug_id').all(targetId) as Row[]).map((r) => ({
+      id: String(r.bug_id),
+      title: String(r.title),
+      match: json<string[]>(r.match),
+    }))
+  }
+
   listReviewQueue(): Claim[] {
     return (
       this.db
         .prepare(
           `SELECT c.* FROM claims c
-           WHERE c.status IN ('disputed', 'unverified')
+           WHERE c.status IN ('needs_review', 'inconclusive')
              AND NOT EXISTS (SELECT 1 FROM claim_reviews r WHERE r.claim_id = c.id)
            ORDER BY c.created_at DESC`,
         )
@@ -886,7 +1044,7 @@ export class QaStore {
   // -------------------------------------------------------------- summaries
 
   summarize(runId: string): RunSummary {
-    const summary: RunSummary = { claims: 0, confirmed: 0, refuted: 0, disputed: 0, unverified: 0, open: 0, ruleChanges: 0 }
+    const summary: RunSummary = { claims: 0, confirmed: 0, rejected: 0, inconclusive: 0, needs_review: 0, candidate: 0, ruleChanges: 0 }
     for (const c of this.listClaims(runId)) {
       summary.claims += 1
       summary[c.status] += 1

@@ -1,5 +1,5 @@
 /**
- * The closed QA DNA event vocabulary (after Kestrel's wire/envelope.py).
+ * The closed QA Arena event vocabulary (after Kestrel's wire/envelope.py).
  *
  * Every durable event has a gap-free global `seq`. A writer must use a
  * registered `type` and supply its required payload fields; anything else is
@@ -17,7 +17,7 @@ export interface Envelope {
 }
 
 export const EVENT_SCHEMAS = {
-  run_created: ['target_name', 'mode', 'roster', 'initiator', 'dna_version'],
+  run_created: ['target_name', 'mode', 'roster', 'initiator', 'dna_version', 'audit'],
   run_started: [],
   run_pause_requested: ['by'],
   run_paused: [],
@@ -41,10 +41,13 @@ export const EVENT_SCHEMAS = {
   app_started: ['url', 'command'],
   app_stopped: ['url', 'reason'],
   surface_noted: ['kind', 'name'],
-  claim_proposed: ['claim_id', 'title', 'severity', 'area', 'has_repro'],
-  challenge_recorded: ['claim_id', 'stance', 'reasoning'],
-  replay_finished: ['claim_id', 'outcome', 'detail'],
+  round_started: ['round'],
+  claim_proposed: ['claim_id', 'title', 'category', 'severity', 'area', 'has_repro'],
+  claim_revised: ['claim_id', 'action', 'round'],
+  challenge_recorded: ['claim_id', 'stance', 'reasoning', 'round'],
+  evidence_checked: ['claim_id', 'round', 'outcome', 'detail'],
   claim_verdict: ['claim_id', 'status', 'reason'],
+  regression_test_written: ['claim_id', 'artifact_id', 'fails_now'],
   claim_reviewed: ['claim_id', 'decision', 'reason', 'reviewer'],
   report_written: ['report_id', 'version', 'author'],
   rule_change_proposed: ['change_id', 'op', 'role', 'text'],
@@ -69,6 +72,7 @@ export const SHARED_FACT_EVENTS: ReadonlySet<EventType> = new Set<EventType>([
   'run_completed',
   'run_failed',
   'phase_finished',
+  'claim_proposed',
   'claim_verdict',
   'claim_reviewed',
   'rule_change_proposed',

@@ -1,12 +1,14 @@
 /**
- * Best-effort stack detection for an imported app: languages, frameworks,
- * and the commands that probably install, start, and test it. These are
- * hints for the Builder, not instructions; nothing here runs anything.
+ * Read-only discovery for an imported app (build plan, section 03):
+ * languages, frameworks, likely commands, routes, tests, risky areas, and
+ * files that look like they hold secrets (names only, never contents).
+ * These are hints for the questionnaire and the workers. Nothing here runs
+ * anything from the app.
  */
 
 import { existsSync, readFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
-import type { StackInfo } from '../shared/domain'
+import type { AreaId, StackInfo } from '../shared/domain'
 
 const LANGUAGE_BY_EXT: Record<string, string> = {
   '.js': 'JavaScript',
@@ -99,6 +101,9 @@ export function detectStack(root: string, files: string[]): StackInfo {
   const readmeName = files.find((f) => /^readme(\.md|\.txt)?$/i.test(f))
   const readme = readmeName ? readText(join(root, readmeName), 4000) : null
 
+  const scan = scanSources(root, files)
+  if (!commands.test && scan.testRunner) commands.test = scan.testRunner
+
   return {
     languages: [...languages.entries()].map(([name, count]) => ({ name, files: count })).sort((a, b) => b.files - a.files).slice(0, 6),
     frameworks: [...new Set(frameworks)],
@@ -106,5 +111,72 @@ export function detectStack(root: string, files: string[]): StackInfo {
     commands,
     readmeExcerpt: readme ? readme.slice(0, 1200) : null,
     topLevel: [...new Set(files.map((f) => f.split('/')[0]))].sort().slice(0, 40),
+    routes: scan.routes,
+    tests: { files: scan.testFiles, runner: commands.test },
+    areas: scan.areas,
+    sensitive: files.filter((f) => SENSITIVE.test(f.split('/').pop() ?? '')).slice(0, 40),
+    mentionsTestAccounts: readme !== null && /test (user|account)s?|demo (user|account)s?|sample (user|account)s?/i.test(readme),
   }
+}
+
+const SENSITIVE = /^(\.env(\..+)?|.+\.pem|.+\.key|id_rsa|id_ed25519|credentials\.json|secrets?\.(json|ya?ml|toml)|\.npmrc|\.pypirc|service-?account.*\.json)$/i
+const SOURCE = /\.(js|mjs|cjs|jsx|ts|tsx|py|rb|go|php|java|kt|rs|vue|svelte)$/i
+const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[cm]?[jt]sx?$|(^|\/)test_[^/]+\.py$|_test\.go$/i
+
+const AREA_PATTERNS: Record<Exclude<AreaId, 'api'>, RegExp> = {
+  auth: /\b(login|logout|signin|sign_in|signup|password|passwd|jwt|session|authenticate|bearer|oauth)\b/i,
+  payments: /\b(payment|checkout|cart|price|pricing|stripe|invoice|order|discount|coupon|billing|refund)\b/i,
+  admin: /\b(admin|isAdmin|is_admin|superuser|role|permission)\b/i,
+  upload: /\b(upload|multer|multipart|formidable|busboy|UploadFile)\b/i,
+  data: /\b(SELECT\s|INSERT\s+INTO|DELETE\s+FROM|sequelize|prisma|mongoose|knex|sqlite3?|psycopg|SQLAlchemy|mysql|redis)\b/i,
+}
+
+const ROUTE_PATTERNS: { re: RegExp; method: (m: RegExpMatchArray) => string; path: (m: RegExpMatchArray) => string }[] = [
+  // Express, Koa router, Fastify, Hono
+  { re: /\b(?:app|router|server|fastify|api|route)\.(get|post|put|patch|delete|all)\(\s*['"`]([^'"`]+)['"`]/gi, method: (m) => m[1].toUpperCase(), path: (m) => m[2] },
+  // FastAPI
+  { re: /@\w+\.(get|post|put|patch|delete)\(\s*['"]([^'"]+)['"]/gi, method: (m) => m[1].toUpperCase(), path: (m) => m[2] },
+  // Flask
+  { re: /@\w+\.route\(\s*['"]([^'"]+)['"]/gi, method: () => 'ANY', path: (m) => m[1] },
+  // Plain Node http servers comparing the pathname
+  { re: /pathname\s*===?\s*['"](\/[^'"]*)['"]/g, method: () => 'ANY', path: (m) => m[1] },
+]
+
+function scanSources(root: string, files: string[]): { routes: StackInfo['routes']; testFiles: number; testRunner: string | null; areas: StackInfo['areas'] } {
+  const routes: StackInfo['routes'] = []
+  const areaFiles = new Map<AreaId, string[]>()
+  let testFiles = 0
+  let scanned = 0
+  for (const file of files) {
+    if (TEST_FILE.test(file)) {
+      testFiles += 1
+      continue
+    }
+    if (!SOURCE.test(file) || scanned >= 400) continue
+    const text = readText(join(root, file), 512 * 1024)
+    if (text === null) continue
+    scanned += 1
+    for (const [area, re] of Object.entries(AREA_PATTERNS) as [AreaId, RegExp][]) {
+      if (re.test(file) || re.test(text)) {
+        const list = areaFiles.get(area) ?? []
+        if (list.length < 6) list.push(file)
+        areaFiles.set(area, list)
+      }
+    }
+    if (routes.length >= 200) continue
+    for (const pattern of ROUTE_PATTERNS) {
+      for (const m of text.matchAll(pattern.re)) {
+        if (routes.length >= 200) break
+        const index = m.index ?? 0
+        const line = text.slice(0, index).split('\n').length
+        const path = pattern.path(m)
+        if (!path.startsWith('/')) continue
+        if (routes.some((r) => r.path === path && r.method === pattern.method(m))) continue
+        routes.push({ method: pattern.method(m), path, location: `${file}:${line}` })
+      }
+    }
+  }
+  const areas: StackInfo['areas'] = [...areaFiles.entries()].map(([id, list]) => ({ id, files: list }))
+  if (routes.length > 0) areas.push({ id: 'api', files: [...new Set(routes.map((r) => r.location.split(':')[0]))].slice(0, 6) })
+  return { routes, testFiles, testRunner: null, areas }
 }
