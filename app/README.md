@@ -1,6 +1,6 @@
 # Baton
 
-An Electron app for evidence-driven application audits. Five worker roles build the app, investigate it, challenge findings, write a report, and propose improvements to their rules. The six screens are **Projects**, **Audit setup**, **Arena**, **Findings**, **DNA**, and **Settings**.
+Baton is a desktop app that orchestrates AI agents to audit software. Five agents build the app, test it, review each other's findings, write the report, and suggest playbook improvements. Every finding is reproduced or checked against the code before it counts. The screens are **Audits**, **New audit**, **Projects**, **Findings**, **Playbook**, and **Settings**.
 
 ## Run locally
 
