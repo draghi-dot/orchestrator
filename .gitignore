@@ -1,0 +1,14 @@
+# OS and tooling
+.DS_Store
+*.log
+node_modules/
+
+# App build output and caches
+app/out/
+app/dist/
+app/.vitest/
+
+# Reference material we did not write and must not redistribute
+kestrel-qa-reference-2026-10-27/
+ctf-important-writeups/
+*.zip
