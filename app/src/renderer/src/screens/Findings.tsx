@@ -1,29 +1,124 @@
-import { useState } from 'react'
-import { CATEGORY_LABEL, TERMINAL_RUN_STATES, type Run } from '../../../shared/domain'
-import type { Finding } from '../../../shared/ipc'
-import { ArtifactViewer } from '../components/ArtifactViewer'
-import { Badge, Empty, ErrorBox, Loading, Modal, PageHead, useToast } from '../components/ui'
-import { command, useQuery } from '../lib/api'
+import { useMemo, useState } from 'react'
+import type { ClaimStatus } from '../../../shared/domain'
+import { Header } from '../App'
+import { CATEGORY, FINDING_STATUS } from '../copy'
+import { FindingPanel, effectiveStatus } from '../components/FindingPanel'
+import { I } from '../components/icons'
+import { Empty, ErrorBanner, Loading, Pill, Severity } from '../components/ui'
+import { useQuery } from '../lib/api'
+import { formatDateTime } from '../lib/format'
 import { useLive } from '../lib/stream'
-export const findingStatus = (c: Finding) => c.review ? c.review.decision === 'accepted' ? 'confirmed' : 'rejected' : c.status
-export function FindingDetail({ claim, run, onClose, onChanged }: { claim: Finding; run: Run; onClose: () => void; onChanged: () => void }) {
-  const [reason, setReason] = useState(''); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [artifact, setArtifact] = useState<string | null>(null); const toast = useToast()
-  const review = async (decision: 'accepted' | 'rejected') => {
-    setBusy(true); setError(null)
-    try { await command({ type: 'reviewClaim', claimId: claim.id, decision, reason }); onChanged(); toast('Review recorded'); onClose() } catch (e) { setError(String(e)) } finally { setBusy(false) }
-  }
-  return <Modal title={claim.title} onClose={onClose} wide><div className="tag-row"><Badge status={findingStatus(claim)}/><span className={`severity severity--${claim.severity}`}>{claim.severity}</span><span className="tag">{CATEGORY_LABEL[claim.category]}</span><span className="tag">Round {claim.round}</span></div><p className="prose">{claim.detail}</p><h3>Severity reason</h3><p>{claim.severityRationale}</p>{claim.verdictReason && <div className="callout"><strong>Host verdict</strong><p>{claim.verdictReason}</p></div>}
-    {claim.evidenceQuote && <><h3>Code evidence <small className="mono muted">{claim.location}</small></h3><pre className="codeblock">{claim.evidenceQuote}</pre></>}
-    {claim.reproduction && <><h3>Reproduction</h3><pre className="codeblock">{JSON.stringify(claim.reproduction, null, 2)}</pre></>}
-    {claim.suggestedFix && <><h3>Suggested fix</h3><p className="prose">{claim.suggestedFix}</p></>}
-    <h3>Challenge and verification</h3><div className="stack compact">{claim.challenges.map((c) => <div className="evidence-row" key={c.id}><Badge status={c.stance}/><strong>Round {c.round} · {c.runtime}</strong><p>{c.reasoning}</p></div>)}{claim.verifications.map((v, i) => <div className="evidence-row" key={`${v.round}-${i}`}><Badge status={v.outcome}/><strong>Host · Round {v.round}</strong><p>{v.detail}</p>{v.expected !== null && <pre className="codeblock">Expected: {v.expected}{'\n'}Actual: {v.actual}</pre>}{v.artifactId && <button className="text-btn" onClick={() => setArtifact(v.artifactId)}>View replay evidence →</button>}</div>)}</div>
-    {claim.regressionTestArtifactId && <button className="btn spaced" onClick={() => setArtifact(claim.regressionTestArtifactId)}>View regression test →</button>}
-    {claim.review && <div className="callout spaced"><strong>Operator {claim.review.decision} · {claim.review.reviewer}</strong><p>{claim.review.reason}</p></div>}
-    <hr/><h3>Your review</h3><p className="muted">Your decision is recorded separately from the host’s original verdict.</p><ErrorBox error={error}/>{TERMINAL_RUN_STATES.has(run.state) && !claim.review && ['needs_review', 'inconclusive'].includes(claim.status) ? <><label className="field">Reason<textarea rows={3} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Explain the evidence behind your decision."/></label><div className="row"><button className="btn btn--primary" disabled={busy || !reason.trim()} onClick={() => void review('accepted')}>Accept finding</button><button className="btn" disabled={busy || !reason.trim()} onClick={() => void review('rejected')}>Reject finding</button></div></> : <p className="muted">{!TERMINAL_RUN_STATES.has(run.state) ? 'Review becomes available after the run finishes.' : claim.review ? 'This review has been recorded.' : 'Only unresolved findings need an operator decision.'}</p>}{artifact && <ArtifactViewer artifactId={artifact} onClose={() => setArtifact(null)}/>}</Modal>
-}
+
+const ORDER: ClaimStatus[] = ['needs_review', 'confirmed', 'inconclusive', 'candidate', 'rejected']
+const SEVERITY = { high: 0, medium: 1, low: 2 } as Record<string, number>
+
 export function FindingsScreen() {
-  const live = useLive(); const q = useQuery('findings', undefined, live.version); const [search, setSearch] = useState(''); const [filter, setFilter] = useState('all'); const [severity, setSeverity] = useState('all'); const [selected, setSelected] = useState<string | null>(null)
-  const items = (q.data ?? []).filter(({ claim, run }) => (filter === 'all' || findingStatus(claim) === filter) && (severity === 'all' || claim.severity === severity) && `${claim.title} ${run.contract.targetName} ${claim.category}`.toLowerCase().includes(search.toLowerCase()))
-  const current = q.data?.find((x) => x.claim.id === selected)
-  return <><PageHead eyebrow="04 / FINDINGS" title="Evidence, before opinions." description="Review the reproduction, the challenge, and the host’s check in one place."/><div className="filter-bar"><input aria-label="Search findings" placeholder="Search findings or projects…" value={search} onChange={(e) => setSearch(e.target.value)}/><select aria-label="Finding status" value={filter} onChange={(e) => setFilter(e.target.value)}>{['all', 'confirmed', 'needs_review', 'inconclusive', 'rejected', 'candidate'].map((s) => <option value={s} key={s}>{s.replaceAll('_', ' ')}</option>)}</select><select aria-label="Finding severity" value={severity} onChange={(e) => setSeverity(e.target.value)}>{['all', 'high', 'medium', 'low'].map((s) => <option key={s} value={s}>{s === 'all' ? 'All severities' : s}</option>)}</select><span className="muted">{items.length} findings</span></div><ErrorBox error={q.error}/>{q.loading && !q.data ? <Loading/> : <div className="panel">{items.length ? items.map(({ claim, run }) => <button className="finding-row" key={claim.id} onClick={() => setSelected(claim.id)}><span className={`severity severity--${claim.severity}`}>{claim.severity}</span><span className="finding-row__body"><strong>{claim.title}</strong><small>{run.contract.targetName} · {CATEGORY_LABEL[claim.category]} · {claim.location ?? 'HTTP reproduction'}</small></span><Badge status={findingStatus(claim)}/><span>↗</span></button>) : <Empty title="No findings here yet.">Run an audit or adjust your filter.</Empty>}</div>}{current && <FindingDetail claim={current.claim} run={current.run} onClose={() => setSelected(null)} onChanged={q.refetch}/>}</>
+  const live = useLive()
+  const q = useQuery('findings', undefined, live.version)
+  const [search, setSearch] = useState('')
+  const [status, setStatus] = useState<ClaimStatus | 'all'>('all')
+  const [severity, setSeverity] = useState('all')
+  const [project, setProject] = useState('all')
+  const [selected, setSelected] = useState<string | null>(null)
+
+  const all = q.data ?? []
+  const projects = useMemo(() => [...new Set(all.map((x) => x.run.contract.targetName))].sort(), [all])
+  const items = all
+    .filter(({ claim, run }) => {
+      const s = effectiveStatus(claim)
+      const text = `${claim.title} ${claim.location ?? ''} ${run.contract.targetName}`.toLowerCase()
+      return (status === 'all' || s === status) && (severity === 'all' || claim.severity === severity) && (project === 'all' || run.contract.targetName === project) && text.includes(search.trim().toLowerCase())
+    })
+    .sort((a, b) => ORDER.indexOf(effectiveStatus(a.claim)) - ORDER.indexOf(effectiveStatus(b.claim)) || (SEVERITY[a.claim.severity] ?? 3) - (SEVERITY[b.claim.severity] ?? 3))
+  const current = all.find((x) => x.claim.id === selected)
+
+  return (
+    <>
+      <Header title="Findings" />
+      <div className="content">
+        <div className="page">
+          <ErrorBanner error={q.error} />
+          <div className="filters">
+            <div className="search">
+              <I.search size={15} />
+              <input className="input" placeholder="Search findings" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search findings" />
+            </div>
+            <select className="select" value={status} onChange={(e) => setStatus(e.target.value as ClaimStatus | 'all')} aria-label="Status">
+              <option value="all">All statuses</option>
+              {ORDER.map((s) => (
+                <option key={s} value={s}>
+                  {FINDING_STATUS[s].label}
+                </option>
+              ))}
+            </select>
+            <select className="select" value={severity} onChange={(e) => setSeverity(e.target.value)} aria-label="Severity">
+              <option value="all">All severities</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+            {projects.length > 1 && (
+              <select className="select" value={project} onChange={(e) => setProject(e.target.value)} aria-label="Project">
+                <option value="all">All projects</option>
+                {projects.map((p) => (
+                  <option key={p}>{p}</option>
+                ))}
+              </select>
+            )}
+            <span className="spacer" />
+            <span className="small faint">{items.length} shown</span>
+          </div>
+          {!q.data ? (
+            <Loading />
+          ) : items.length ? (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th style={{ width: 110 }}>Severity</th>
+                    <th>Finding</th>
+                    <th>Project</th>
+                    <th>Category</th>
+                    <th>Status</th>
+                    <th>Reported</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map(({ claim, run }) => {
+                    const s = FINDING_STATUS[effectiveStatus(claim)]
+                    return (
+                      <tr key={claim.id} className={`clickable ${selected === claim.id ? 'selected' : ''}`} onClick={() => setSelected(claim.id)}>
+                        <td>
+                          <Severity level={claim.severity} />
+                        </td>
+                        <td>
+                          <div className="cell-title">{claim.title}</div>
+                          {claim.location && <div className="cell-sub mono">{claim.location}</div>}
+                        </td>
+                        <td className="muted">{run.contract.targetName}</td>
+                        <td className="muted">{CATEGORY[claim.category]}</td>
+                        <td>
+                          <Pill tone={s.tone} dot>
+                            {s.label}
+                          </Pill>
+                        </td>
+                        <td className="muted small tnum">{formatDateTime(claim.createdAt)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="card">
+              <Empty icon={<I.findings size={22} />} title={all.length ? 'No findings match these filters' : 'No findings yet'}>
+                {all.length ? 'Try a different status or severity.' : 'Findings from every audit appear here, newest problems first.'}
+              </Empty>
+            </div>
+          )}
+        </div>
+      </div>
+      {current && <FindingPanel finding={current.claim} run={current.run} onClose={() => setSelected(null)} onChanged={q.refetch} />}
+    </>
+  )
 }

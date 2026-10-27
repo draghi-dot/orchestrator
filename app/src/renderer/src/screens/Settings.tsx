@@ -1,18 +1,253 @@
 import { useEffect, useRef, useState } from 'react'
-import { RUNTIME_LABEL, type RuntimeSettings } from '../../../shared/domain'
+import type { AccountStatus, RuntimeSettings } from '../../../shared/domain'
 import type { LoginUpdate } from '../../../shared/ipc'
-import { Icon } from '../components/icons'
-import { RosterEditor } from '../components/RosterEditor'
-import { Badge, ErrorBox, Loading, PageHead, useToast } from '../components/ui'
+import { Header } from '../App'
+import { PROVIDER } from '../copy'
+import { AgentTable } from '../components/AgentTable'
+import { I, Spinner } from '../components/icons'
+import { ErrorBanner, Field, Loading, Pill, useAction, useToast } from '../components/ui'
 import { command, useQuery } from '../lib/api'
+
 export function SettingsScreen() {
-  const pending = useQuery('activeLogins', undefined); const receivedUpdate = useRef(false)
-  const settings = useQuery('settings', undefined); const accounts = useQuery('accounts', undefined); const [draft, setDraft] = useState<RuntimeSettings | null>(null); const [login, setLogin] = useState<LoginUpdate | null>(null); const [input, setInput] = useState(''); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const toast = useToast()
-  useEffect(() => { if (settings.data) setDraft(settings.data) }, [settings.data])
-  useEffect(() => { if (!receivedUpdate.current && pending.data?.length) setLogin(pending.data[0]) }, [pending.data])
-  useEffect(() => window.qa.onLoginUpdate((update) => { receivedUpdate.current = true; setLogin(update); if (update.state !== 'waiting') accounts.refetch() }), [accounts.refetch])
-  const action = async (work: () => Promise<unknown>, message?: string) => { setBusy(true); setError(null); try { await work(); if (message) toast(message); accounts.refetch() } catch (e) { setError(String(e)) } finally { setBusy(false) } }
-  return <><PageHead eyebrow="06 / SETTINGS" title="Your workers. Your workspace." description="Connect the installed CLIs and choose the defaults for future audits."/><ErrorBox error={error ?? settings.error ?? accounts.error}/><div className="section-head"><h2>Provider accounts</h2><button className="text-btn" onClick={accounts.refetch}><Icon name="refresh" size={16}/>Refresh status</button></div><div className="provider-grid">{accounts.data?.map((a) => <article className="panel padded" key={a.runtime}><div className="row spread"><h3>{RUNTIME_LABEL[a.runtime]}</h3><Badge status={!a.installed ? 'missing' : a.runtime === 'omp' ? 'external' : a.signedIn ? 'connected' : 'signed_out'}/></div><p className="muted">{a.account ?? (a.runtime === 'omp' ? 'Account managed with omp login in your terminal.' : a.signedIn ? 'Connected through the CLI' : 'Sign in to use this worker.')}</p><small className="mono provider-version">{a.version ?? a.path ?? 'CLI not found'}</small>{a.error && <p className="small muted">{a.error}</p>}{a.runtime !== 'omp' && <button className="btn full spaced" disabled={busy || !a.installed || login?.state === 'waiting'} onClick={() => void action(() => command({ type: a.signedIn ? 'logout' : 'startLogin', runtime: a.runtime }))}>{a.signedIn ? 'Sign out' : `Sign in to ${RUNTIME_LABEL[a.runtime]}`}</button>}</article>) ?? <Loading/>}</div>
-    {login && <section className="panel padded spaced"><div className="row spread"><h3>{RUNTIME_LABEL[login.runtime]} sign-in</h3><Badge status={login.state}/></div>{login.lines.length > 0 && <pre className="codeblock">{login.lines.join('\n')}</pre>}{login.message && <p>{login.message}</p>}{login.state === 'waiting' && <><div className="row">{login.url && <button className="btn btn--primary" disabled={busy} onClick={() => void action(() => command({ type: 'openLoginUrl', sessionId: login.sessionId }))}>Open sign-in page <Icon name="link"/></button>}<button className="btn" disabled={busy} onClick={() => void action(() => command({ type: 'cancelLogin', sessionId: login.sessionId }))}>Cancel sign-in</button></div>{login.runtime === 'claude' && <form className="row spaced" onSubmit={(e) => { e.preventDefault(); void action(async () => { await command({ type: 'sendLoginInput', sessionId: login.sessionId, text: input }); setInput('') }) }}><label className="field grow">Authorization code, if the CLI asks<input type="password" autoComplete="off" value={input} onChange={(e) => setInput(e.target.value)}/></label><button className="btn" disabled={busy || !input.trim()}>Submit code</button></form>}</>}</section>}
-    {!draft ? <Loading/> : <form onSubmit={(e) => { e.preventDefault(); void action(async () => { await command({ type: 'saveSettings', settings: draft }); settings.refetch() }, 'Settings saved') }}><div className="section-head"><h2>Workspace defaults</h2><button className="btn btn--primary" disabled={busy}>Save settings <Icon name="check"/></button></div><section className="panel padded"><RosterEditor value={draft.defaultRoster} onChange={(defaultRoster) => setDraft({ ...draft, defaultRoster })}/></section><section className="panel padded spaced"><h3>Writeup library</h3><p className="muted">A local folder of Markdown writeups. Workers may cite them as background; they never count as evidence of a bug in your app.</p><label className="field">Library directory<input placeholder="/path/to/ctf-important-writeups" value={draft.knowledgePath} onChange={(e) => setDraft({ ...draft, knowledgePath: e.target.value })}/></label></section><details className="panel padded spaced"><summary>CLI executable paths</summary><p className="muted">Use an executable name on PATH or an absolute path. Each provider handles its own credentials.</p>{(['claudeCommand', 'codexCommand', 'ompCommand'] as const).map((key) => <label className="field" key={key}>{key.replace('Command', '')}<input className="mono" value={draft[key]} onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}/></label>)}</details></form>}</>
+  const settings = useQuery('settings', undefined)
+  const accounts = useQuery('accounts', undefined)
+  const pending = useQuery('activeLogins', undefined)
+  const [draft, setDraft] = useState<RuntimeSettings | null>(null)
+  const [login, setLogin] = useState<LoginUpdate | null>(null)
+  const sawUpdate = useRef(false)
+  const save = useAction()
+  const account = useAction()
+  const toast = useToast()
+
+  useEffect(() => {
+    if (settings.data && !draft) setDraft(settings.data)
+  }, [settings.data, draft])
+  useEffect(() => {
+    if (!sawUpdate.current && pending.data?.length) setLogin(pending.data[0])
+  }, [pending.data])
+  useEffect(
+    () =>
+      window.qa.onLoginUpdate((u) => {
+        sawUpdate.current = true
+        setLogin(u)
+        if (u.state !== 'waiting') accounts.refetch()
+      }),
+    [accounts.refetch],
+  )
+
+  const dirty = draft && settings.data && JSON.stringify(draft) !== JSON.stringify(settings.data)
+
+  return (
+    <>
+      <Header
+        title="Settings"
+        actions={
+          <button
+            className="btn btn--primary"
+            disabled={!dirty || save.busy}
+            onClick={() =>
+              void save.run(async () => {
+                await command({ type: 'saveSettings', settings: draft! })
+                settings.refetch()
+                toast('Settings saved')
+              })
+            }
+          >
+            Save changes
+          </button>
+        }
+      />
+      <div className="content">
+        <div className="page" style={{ maxWidth: 900 }}>
+          <ErrorBanner error={save.error ?? settings.error} />
+
+          <div className="section-title" style={{ marginTop: 0 }}>
+            <h2>Accounts</h2>
+            <span className="spacer" />
+            <button className="btn btn--sm btn--ghost" onClick={accounts.refetch}>
+              <I.refresh size={14} />
+              Refresh
+            </button>
+          </div>
+          <p className="small muted" style={{ marginBottom: 12 }}>
+            Agents run through the official Claude and Codex apps on this Mac. You sign in with them directly; Baton never sees your credentials.
+          </p>
+          <ErrorBanner error={account.error ?? accounts.error} />
+          <div className="card">
+            {!accounts.data ? (
+              <Loading label="Checking accounts" />
+            ) : (
+              accounts.data.map((a) => (
+                <AccountRow
+                  key={a.runtime}
+                  account={a}
+                  login={login?.runtime === a.runtime ? login : null}
+                  busy={account.busy}
+                  onSignIn={() => void account.run(() => command({ type: 'startLogin', runtime: a.runtime }))}
+                  onSignOut={() => void account.run(async () => {
+                    await command({ type: 'logout', runtime: a.runtime })
+                    accounts.refetch()
+                  })}
+                  onOpen={(id) => void account.run(() => command({ type: 'openLoginUrl', sessionId: id }))}
+                  onCancel={(id) => void account.run(() => command({ type: 'cancelLogin', sessionId: id }))}
+                  onCode={(id, text) => account.run(() => command({ type: 'sendLoginInput', sessionId: id, text }))}
+                />
+              ))
+            )}
+          </div>
+
+          {!draft ? (
+            <Loading />
+          ) : (
+            <>
+              <div className="section-title">
+                <h2>Default agents</h2>
+              </div>
+              <p className="small muted" style={{ marginBottom: 12 }}>
+                New audits start with these. You can change them per audit.
+              </p>
+              <AgentTable value={draft.defaultRoster} onChange={(defaultRoster) => setDraft({ ...draft, defaultRoster })} accounts={accounts.data} />
+
+              <div className="section-title">
+                <h2>Knowledge library</h2>
+              </div>
+              <div className="card card--pad stack stack--sm">
+                <Field label="Folder" hint="Markdown writeups agents may search for background. Never treated as evidence. Leave empty to use the bundled library if present.">
+                  <input className="input mono" placeholder="/path/to/writeups" value={draft.knowledgePath} onChange={(e) => setDraft({ ...draft, knowledgePath: e.target.value })} />
+                </Field>
+              </div>
+
+              <details className="fold">
+                <summary>
+                  <I.caretRight size={14} />
+                  Advanced
+                </summary>
+                <div className="card card--pad stack">
+                  {(['claudeCommand', 'codexCommand', 'ompCommand'] as const).map((k) => (
+                    <Field key={k} label={`${k === 'claudeCommand' ? 'Claude' : k === 'codexCommand' ? 'Codex' : 'oh-my-pi'} command`} hint={k === 'claudeCommand' ? 'A name on your PATH or an absolute path.' : undefined}>
+                      <input className="input mono" value={draft[k]} onChange={(e) => setDraft({ ...draft, [k]: e.target.value })} />
+                    </Field>
+                  ))}
+                </div>
+              </details>
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
+function AccountRow({
+  account,
+  login,
+  busy,
+  onSignIn,
+  onSignOut,
+  onOpen,
+  onCancel,
+  onCode,
+}: {
+  account: AccountStatus
+  login: LoginUpdate | null
+  busy: boolean
+  onSignIn: () => void
+  onSignOut: () => void
+  onOpen: (sessionId: string) => void
+  onCancel: (sessionId: string) => void
+  onCode: (sessionId: string, text: string) => Promise<boolean>
+}) {
+  const [code, setCode] = useState('')
+  const name = PROVIDER[account.runtime].name
+  const waiting = login?.state === 'waiting'
+  const external = account.runtime === 'omp'
+  const status = !account.installed ? (
+    <Pill tone="outline">Not installed</Pill>
+  ) : account.signedIn ? (
+    <Pill tone="success" dot>
+      Connected
+    </Pill>
+  ) : waiting ? (
+    <Pill tone="accent">
+      <Spinner size={11} />
+      Signing in
+    </Pill>
+  ) : (
+    <Pill>Not connected</Pill>
+  )
+
+  return (
+    <>
+      <div className="list-row">
+        <span className="provider-mark">
+          <I.terminal size={17} />
+        </span>
+        <div className="list-row__main">
+          <div className="row">
+            <span className="list-row__title">{name}</span>
+            {status}
+          </div>
+          <div className="list-row__sub">
+            {account.signedIn && account.account ? account.account : !account.installed ? `Install the ${name} CLI to use it.` : external ? 'Sign in with omp login in Terminal.' : 'Sign in to use it for agents.'}
+            {account.version && <span className="faint">{`  ${account.version}`}</span>}
+          </div>
+        </div>
+        {!external &&
+          account.installed &&
+          (account.signedIn ? (
+            <button className="btn btn--sm" disabled={busy} onClick={onSignOut}>
+              Sign out
+            </button>
+          ) : (
+            <button className="btn btn--sm btn--primary" disabled={busy || waiting} onClick={onSignIn}>
+              Sign in
+            </button>
+          ))}
+      </div>
+      {login && login.state !== 'succeeded' && (
+        <div className="login-box stack stack--sm">
+          <div className="small">
+            {login.state === 'waiting' ? 'Finish signing in in your browser.' : login.message ?? 'Sign-in did not complete.'}
+          </div>
+          {waiting && (
+            <>
+              <div className="row">
+                {login.url && (
+                  <button className="btn btn--sm" disabled={busy} onClick={() => onOpen(login.sessionId)}>
+                    <I.external size={14} />
+                    Open sign-in page
+                  </button>
+                )}
+                <button className="btn btn--sm btn--ghost" disabled={busy} onClick={() => onCancel(login.sessionId)}>
+                  Cancel
+                </button>
+              </div>
+              {account.runtime === 'claude' && (
+                <form
+                  className="row"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    void onCode(login.sessionId, code).then((ok) => ok && setCode(''))
+                  }}
+                >
+                  <input className="input" type="password" autoComplete="off" placeholder="Paste the code from the browser, if asked" value={code} onChange={(e) => setCode(e.target.value)} />
+                  <button className="btn btn--sm" disabled={busy || !code.trim()}>
+                    Submit
+                  </button>
+                </form>
+              )}
+              {login.lines.length > 0 && (
+                <details>
+                  <summary className="small faint">Details</summary>
+                  <pre className="code" style={{ marginTop: 6 }}>
+                    {login.lines.slice(-12).join('\n')}
+                  </pre>
+                </details>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </>
+  )
 }

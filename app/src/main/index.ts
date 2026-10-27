@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { userInfo } from 'node:os'
 import { basename, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { BrowserWindow, type WebContents, app, dialog, ipcMain, session, shell } from 'electron'
+import { BrowserWindow, type WebContents, app, dialog, ipcMain, session, shell, nativeTheme } from 'electron'
 import type { WorkerProfile } from '../shared/domain'
 import type { Envelope } from '../shared/events'
 import type { Result } from '../shared/ipc'
@@ -28,7 +28,7 @@ import { QaStore } from './store'
 
 const DEV_URL = process.env.ELECTRON_RENDERER_URL
 const RENDERER_FILE = join(__dirname, '../renderer/index.html')
-app.setName('QA Arena')
+app.setName('Baton')
 if (process.env.QA_ARENA_TEST_DATA_DIR) app.setPath('userData', process.env.QA_ARENA_TEST_DATA_DIR)
 let mainWindow: BrowserWindow | null = null
 let orchestrator: Orchestrator | null = null
@@ -55,7 +55,7 @@ function requireTrusted(contents: WebContents, frame: Electron.WebFrameMain | nu
 async function boot(): Promise<void> {
   const dataDir = app.getPath('userData')
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
-  const database = join(dataDir, 'qa-arena.sqlite')
+  const database = join(dataDir, 'baton.sqlite')
   store = new QaStore(openDatabase(database))
   chmodSync(database, 0o600)
   const evidence = new EvidenceStore(join(dataDir, 'evidence'))
@@ -141,7 +141,7 @@ async function boot(): Promise<void> {
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1480, height: 960, minWidth: 1050, minHeight: 700, show: false,
-    backgroundColor: '#f3f3f3', title: 'QA Arena',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#161615' : '#fbfbfa', title: 'Baton',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default', trafficLightPosition: { x: 20, y: 22 },
     webPreferences: { preload: join(__dirname, '../preload/index.js'), contextIsolation: true, sandbox: true, nodeIntegration: false },
   })
@@ -169,7 +169,7 @@ app.whenReady().then(async () => {
   } }))
   await boot()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
-}).catch((err) => { console.error('QA Arena startup failed:', err); app.quit() })
+}).catch((err) => { console.error('Baton startup failed:', err); app.quit() })
 let quitting = false
 app.on('before-quit', (event) => {
   if (quitting) return

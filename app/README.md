@@ -1,4 +1,4 @@
-# QA Arena
+# Baton
 
 An Electron app for evidence-driven application audits. Five worker roles build the app, investigate it, challenge findings, write a report, and propose improvements to their rules. The six screens are **Projects**, **Audit setup**, **Arena**, **Findings**, **DNA**, and **Settings**.
 
@@ -58,7 +58,7 @@ Set a local Markdown directory in Settings. On a fresh development installation,
 
 ## Persistence and controls
 
-Data lives in Electron's `userData` directory (normally `~/Library/Application Support/QA Arena` on macOS): `qa-arena.sqlite`, `runtime-settings.json`, snapshots, runs, and content-addressed evidence. Test-account headers live in the local SQLite database, whose file permissions are restricted to the current user; they are not encrypted in a separate vault. Renderer queries return only account names/header names/configuration status. Host-injected values are redacted from captured HTTP responses and regression logs.
+Data lives in Electron's `userData` directory (normally `~/Library/Application Support/Baton` on macOS): `qa-arena.sqlite`, `runtime-settings.json`, snapshots, runs, and content-addressed evidence. Test-account headers live in the local SQLite database, whose file permissions are restricted to the current user; they are not encrypted in a separate vault. Renderer queries return only account names/header names/configuration status. Host-injected values are redacted from captured HTTP responses and regression logs.
 
 Runs freeze the snapshot, scope, lineup, limits, and DNA version. Start requests are idempotent. A single queue executes runs; pause takes effect at a safe checkpoint. Cancellation stops workers, revokes their leases, and rejects late writes. Restart marks interrupted active work failed/cancelled and continues queued work. Live view and event replay use the same reducer. Evidence is checked against its hash when opened or exported. Test accounts cannot change while their project has active/queued work. Operator decisions preserve the original host verdict.
 

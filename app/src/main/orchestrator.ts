@@ -163,16 +163,16 @@ export class Orchestrator {
     }
 
     await this.phase(run, 'build', async () => {
-      if (run.contract.mode === 'white') return 'Source-only audit; no app process required'
+      if (run.contract.mode === 'white') return 'Code review only; nothing to start'
       if (run.contract.externalUrl) return 'Using the authorized test URL'
       await this.task(run, 'build', 0, 1)
-      if (!this.store.getRun(run.id).appUrl) throw new Error('Builder did not start the app; running-app audit cannot continue')
+      if (!this.store.getRun(run.id).appUrl) throw new Error('The build agent did not start the app, so live testing could not continue')
       return 'App started and ready for testing'
     })
     await this.phase(run, 'research', async () => {
       await this.task(run, 'research', 0, 1)
       await this.task(run, 'research', 1, 1, 'reporter', 'research', false)
-      return `${this.store.listClaims(run.id).length} findings proposed`
+      return `${this.store.listClaims(run.id).length} findings reported`
     })
     await this.phase(run, 'challenge', async () => {
       for (let round = 1; round <= run.contract.limits.maxRounds; round++) {
@@ -190,19 +190,19 @@ export class Orchestrator {
         await this.verify(run, round)
       }
       for (const claim of this.store.listClaims(run.id)) {
-        if (claim.status === 'candidate') this.store.settleClaim(claim.id, 'inconclusive', 'No completed evidence and challenge cycle')
+        if (claim.status === 'candidate') this.store.settleClaim(claim.id, 'inconclusive', 'Not reviewed and verified before the audit ended')
       }
-      return 'Host evidence checks and debate finished'
+      return 'Review and verification finished'
     })
     await this.phase(run, 'report', async () => {
       const previousReport = this.store.latestReport(run.id)?.id
       await this.task(run, 'report', 0, 1)
-      if (this.store.latestReport(run.id)?.id === previousReport) this.store.writeReport(run.id, null, 'QA Arena host', this.fallbackReport(run))
+      if (this.store.latestReport(run.id)?.id === previousReport) this.store.writeReport(run.id, null, 'Baton', this.fallbackReport(run))
       return 'Final report saved'
     })
     await this.phase(run, 'improve', async () => {
       await this.task(run, 'improve', 0, 1)
-      return 'Proposed DNA changes await your review'
+      return 'Playbook suggestions are ready for review'
     })
     await this.checkpoint(run.id)
     const summary = this.store.summarize(run.id)
@@ -328,7 +328,7 @@ export class Orchestrator {
 
   private fallbackReport(run: Run): string {
     const claims = this.store.listClaims(run.id)
-    return `# ${run.contract.targetName} QA report\n\nReporter produced no report. The following facts were recorded by the host.\n\n` +
+    return `# ${run.contract.targetName} QA report\n\nThe report agent did not write a report, so Baton wrote this summary from the recorded results.\n\n` +
       claims.map((c) => `- **${c.status}** — ${c.title} (${c.id}): ${c.verdictReason ?? 'No verdict'}`).join('\n') +
       '\n\n## Coverage limits\n\nThis report does not establish that untested behavior is correct.\n'
   }

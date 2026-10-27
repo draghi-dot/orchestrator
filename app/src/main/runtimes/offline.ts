@@ -231,7 +231,7 @@ export class OfflineRuntime implements AgentRuntime {
       { title: 'Alice can read Bob’s private order', path: '/api/orders/102', as: 'alice', kind: 'status_equals', expected: 403, category: 'authorization', severity: 'high', rule: 'Customers may read only their own orders; another owner must return 403.', quote: 'return order ? json(200, order) : json(404, { error: \'not_found\' })', fix: 'Compare the authenticated customer with order.owner before returning the order.' },
       { title: 'Free shipping fails at the exact $100 threshold', path: '/api/shipping?subtotal=100', kind: 'json_equals', field: 'shipping', expected: 0, category: 'business_logic', severity: 'medium', rule: 'Shipping is free for a subtotal of $100 or more.', quote: 'const shipping = (subtotal) => subtotal > 100 ? 0 : 8', fix: 'Include equality when checking the free-shipping threshold.' },
       { title: 'Negative quantity is accepted by the cart', path: '/api/cart?quantity=-1', kind: 'status_equals', expected: 422, category: 'input_validation', severity: 'high', rule: 'Quantities must be integers between 1 and 99; invalid values return 422.', quote: "if (!Number.isInteger(quantity) || quantity > 99) return json(422, { error: 'invalid_quantity' })", fix: 'Reject quantities below 1 before calculating prices.' },
-      { title: 'Unknown coupons are accepted (decoy probe)', path: '/api/cart?code=UNKNOWN', kind: 'status_equals', expected: 422, category: 'input_validation', severity: 'low', rule: 'Unknown coupons should return HTTP 422. This deliberate sample decoy exercises rejection.', quote: 'const acceptUnknownCoupons = true', fix: 'Keep rejecting unknown coupon codes.' },
+      { title: 'Unknown discount codes may be accepted', path: '/api/cart?code=UNKNOWN', kind: 'status_equals', expected: 422, category: 'input_validation', severity: 'low', rule: 'The checkout should reject unknown discount codes with status 422.', quote: 'const acceptUnknownCoupons = true', fix: 'Reject discount codes that are not in the rates table.', decoy: true },
     ] as const
     for (const p of probes) {
       if ('as' in p && !ctx.tools.accounts().includes(p.as)) {
@@ -244,14 +244,21 @@ export class OfflineRuntime implements AgentRuntime {
       if (http) {
         const response = await this.call(ctx, 'http_request', { ...step })
         if (!response.ok) continue
-        observed = JSON.stringify(data(response))
+        const r = (data(response) ?? {}) as { status?: number; body?: string }
+        let value: unknown
+        try {
+          value = 'field' in p ? (JSON.parse(String(r.body ?? '')) as Record<string, unknown>)[p.field] : undefined
+        } catch {
+          value = undefined
+        }
+        observed = 'field' in p && value !== undefined ? `The app returned ${p.field} = ${JSON.stringify(value)}.` : `The app returned status ${r.status}.`
       }
       const line = source.split('\n').find((l) => l.includes(p.quote))
       const lineNo = line ? Number(/^\s*(\d+)/.exec(line)?.[1] ?? 1) : 1
       const reproduction: Reproduction | undefined = http ? { steps: [step], check: { kind: p.kind, ...('field' in p ? { path: p.field } : {}), expected: p.expected } } : undefined
-      if (!http && !line && p.title.indexOf('decoy') === -1) continue
+      if (!http && !line && !('decoy' in p)) continue
       await this.call(ctx, 'propose_claim', {
-        title: p.title, detail: `${p.rule} ${http ? 'Observed response: ' + observed : 'The source contains the quoted implementation.'}`,
+        title: p.title, detail: `${p.rule} ${http ? observed : 'The source contains the quoted implementation.'}`,
         category: p.category, severity: p.severity,
         severity_rationale: p.category === 'authorization' ? 'Exposes another customer’s private order and address.' : 'Affects customer billing or input validation in checkout.',
         suggested_fix: p.fix,
@@ -259,7 +266,7 @@ export class OfflineRuntime implements AgentRuntime {
         ...(reproduction ? { reproduction } : {}),
       })
     }
-    return { kind: 'finished', reason: 'Sample probes completed; the host must decide the findings' }
+    return { kind: 'finished', reason: 'Testing finished; findings go to review' }
   }
 
   private async revise(ctx: RuntimeContext): Promise<Outcome> {
@@ -309,7 +316,7 @@ export class OfflineRuntime implements AgentRuntime {
         await this.call(ctx, 'challenge_claim', { claim_id: claim.claim_id, stance: 'unsure', reasoning: 'There is no reproduction or code location I can check in this mode.' })
       }
     }
-    return { kind: 'finished', reason: `challenged ${claims.length} claim(s)` }
+    return { kind: 'finished', reason: `Reviewed ${claims.length} finding${claims.length === 1 ? '' : 's'}` }
   }
 
   // ---------------------------------------------------------------- reporter
@@ -329,7 +336,7 @@ export class OfflineRuntime implements AgentRuntime {
       `# ${summary.app.name} QA report`,
       '',
       '## Summary',
-      `${a.context.finalReport ? 'Final' : 'Interim'} report. Mode: ${summary.app.mode}. ${summary.claims.length} claim(s): ${confirmed.length} confirmed, ${rejected.length} rejected, ${open.length} open.`,
+      `${a.context.finalReport ? 'Final' : 'Interim'} report. Mode: ${summary.app.mode}. ${summary.claims.length} finding(s): ${confirmed.length} confirmed, ${rejected.length} false positive(s), ${open.length} open.`,
       '',
       '## Confirmed defects',
       ...(confirmed.length ? confirmed.map((c) => `- **${c.title}** (${c.severity}) at ${c.location ?? 'n/a'}, claim ${c.claim_id}`) : ['None yet.']),
@@ -360,15 +367,15 @@ export class OfflineRuntime implements AgentRuntime {
     const rejected = summary.claims.filter((c) => c.status === 'rejected').length
     const confirmed = summary.claims.filter((c) => c.status === 'confirmed').length
     if (rejected > 0) {
-      proposals.push({ role: 'researcher', text: 'Re-run every reproduction once with http_request and compare the result to your check before you propose the claim.', rationale: `${rejected} claim(s) in this run were rejected when the host replayed them.` })
+      proposals.push({ role: 'researcher', text: 'Re-run every reproduction once with http_request and compare the result to your check before you propose the claim.', rationale: `${rejected} finding(s) in this audit were false positives when Baton replayed them.` })
     }
     if (confirmed > 0) {
       proposals.push({ role: 'researcher', text: 'For every percentage, price, or limit the app states, request the endpoint that applies it and compare the numbers.', rationale: `${confirmed} confirmed defect(s) came from checking a stated rule against the returned totals.` })
     }
     if (summary.workers.some((w) => w.role === 'builder' && w.status === 'blocked')) {
-      proposals.push({ role: 'builder', text: 'Read the README run instructions first and try the documented start command before guessing.', rationale: 'The Builder was blocked in this run.' })
+      proposals.push({ role: 'builder', text: 'Read the README run instructions first and try the documented start command before guessing.', rationale: 'The build agent was blocked in this audit.' })
     }
     for (const p of proposals.filter((p) => !has(p.text)).slice(0, 2)) await this.call(ctx, 'propose_rule_change', { op: 'add', ...p })
-    return { kind: 'finished', reason: 'improvement review done' }
+    return { kind: 'finished', reason: 'Suggestions ready for review' }
   }
 }

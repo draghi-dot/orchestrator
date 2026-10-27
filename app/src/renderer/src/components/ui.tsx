@@ -1,48 +1,182 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
-import { CLAIM_STATUS_LABEL } from '../../../shared/domain'
-import type { ClaimStatus } from '../../../shared/domain'
-import { Icon } from './icons'
-export function Badge({ status }: { status: string }) {
-  const label = CLAIM_STATUS_LABEL[status as ClaimStatus] ?? status.replaceAll('_', ' ')
-  return <span className={`badge badge--${status}`}><span className="status-dot"/>{label}</span>
+import { type ReactNode, createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import type { Tone } from '../copy'
+import { I, Spinner } from './icons'
+
+export function Pill({ tone = 'neutral', dot = false, pulse = false, children, title }: { tone?: Tone; dot?: boolean; pulse?: boolean; children: ReactNode; title?: string }) {
+  const cls = tone === 'neutral' ? '' : `pill--${tone}`
+  const dotCls = tone === 'success' ? 'dot--success' : tone === 'warning' ? 'dot--warning' : tone === 'danger' ? 'dot--danger' : tone === 'accent' ? 'dot--accent' : ''
+  return (
+    <span className={`pill ${cls}`} title={title}>
+      {dot && <span className={`dot ${dotCls} ${pulse ? 'dot--pulse' : ''}`} />}
+      {children}
+    </span>
+  )
 }
-export function PageHead({ title, description, action }: { eyebrow: string; title: string; description?: string; action?: ReactNode }) {
-  return <div className="page-head"><div><h1>{title}</h1>{description && <p className="lead">{description}</p>}</div>{action && <div className="page-actions">{action}</div>}</div>
+
+export function Severity({ level }: { level: string }) {
+  return (
+    <span className={`sev sev--${level}`}>
+      <span className="sev__bar" aria-hidden>
+        <i />
+        <i />
+        <i />
+      </span>
+      {level}
+    </span>
+  )
 }
-export function Empty({ title, children }: { title: string; children?: ReactNode }) {
-  return <div className="empty"><Icon name="arena" size={36}/><h3>{title}</h3>{children && <div className="muted">{children}</div>}</div>
+
+export function Empty({ icon, title, children, actions }: { icon?: ReactNode; title: string; children?: ReactNode; actions?: ReactNode }) {
+  return (
+    <div className="empty">
+      {icon && <div className="empty__icon">{icon}</div>}
+      <h3>{title}</h3>
+      {children && <p>{children}</p>}
+      {actions && <div className="row">{actions}</div>}
+    </div>
+  )
 }
-export function ErrorBox({ error }: { error?: string | null }) { return error ? <div className="callout callout--error" role="alert">{error}</div> : null }
-export function Loading() { return <div className="loading" role="status"><span className="spinner"/>Loading…</div> }
-export function Metric({ value, label, hint }: { value: string | number; label: string; hint?: string }) {
-  return <div className="metric"><span className="metric__value">{value}</span><span className="metric__label">{label}</span>{hint && <small>{hint}</small>}</div>
+
+export function Banner({ tone = 'neutral', children }: { tone?: 'neutral' | 'warning' | 'danger'; children: ReactNode }) {
+  const Icon = tone === 'danger' ? I.warningCircle : tone === 'warning' ? I.warning : I.info
+  return (
+    <div className={`banner ${tone === 'neutral' ? '' : `banner--${tone}`}`} role={tone === 'danger' ? 'alert' : 'status'}>
+      <Icon size={16} />
+      <div>{children}</div>
+    </div>
+  )
 }
-export function Modal({ title, children, onClose, wide = false }: { title: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
-  const close = useRef(onClose); close.current = onClose
-  const dialogRef = useRef<HTMLElement>(null)
+
+export function ErrorBanner({ error }: { error?: string | null }) {
+  return error ? <Banner tone="danger">{error.replace(/^Error:\s*/, '')}</Banner> : null
+}
+
+export function Loading({ label = 'Loading' }: { label?: string }) {
+  return (
+    <div className="loading" role="status">
+      <Spinner />
+      {label}
+    </div>
+  )
+}
+
+export function Field({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
+  return (
+    <label className="field">
+      <span className="field__label">{label}</span>
+      {children}
+      {hint && <span className="field__hint">{hint}</span>}
+    </label>
+  )
+}
+
+export function Tabs<T extends string>({ tabs, value, onChange }: { tabs: { id: T; label: string; count?: number }[]; value: T; onChange: (id: T) => void }) {
+  return (
+    <div className="tabs" role="tablist">
+      {tabs.map((t) => (
+        <button key={t.id} role="tab" aria-selected={value === t.id} className={`tab ${value === t.id ? 'active' : ''}`} onClick={() => onChange(t.id)}>
+          {t.label}
+          {t.count !== undefined && t.count > 0 && <span className="count">{t.count}</span>}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+export function useEscape(onEscape: () => void) {
   useEffect(() => {
-    const focus = document.activeElement as HTMLElement | null
     const handler = (e: KeyboardEvent) => {
-      if (document.querySelectorAll('[role="dialog"]').item(document.querySelectorAll('[role="dialog"]').length - 1) !== dialogRef.current) return
-      if (e.key === 'Escape') close.current()
-      if (e.key === 'Tab') {
-        const dialog = dialogRef.current
-        const fields = Array.from(dialog?.querySelectorAll<HTMLElement>('button:not([disabled]),a[href],input,select,textarea,[tabindex="0"]') ?? [])
-        const first = fields[0], last = fields.at(-1)
-        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus() }
-        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus() }
-      }
+      if (e.key === 'Escape') onEscape()
     }
     window.addEventListener('keydown', handler)
-    const timer = setTimeout(() => dialogRef.current?.querySelector<HTMLElement>('button')?.focus(), 0)
-    return () => { clearTimeout(timer); window.removeEventListener('keydown', handler); focus?.focus() }
+    return () => window.removeEventListener('keydown', handler)
+  }, [onEscape])
+}
+
+export function Modal({ title, onClose, wide = false, footer, children }: { title: ReactNode; onClose: () => void; wide?: boolean; footer?: ReactNode; children: ReactNode }) {
+  useEscape(onClose)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    ref.current?.querySelector<HTMLElement>('input, textarea, select, button:not([aria-label="Close"])')?.focus()
   }, [])
-  return <div className="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}><section ref={dialogRef} className={`modal ${wide ? 'modal--wide' : ''}`} role="dialog" aria-modal="true" aria-label={title}><div className="modal__head"><h2>{title}</h2><button className="icon-btn" onClick={onClose} aria-label="Close"><Icon name="close"/></button></div><div className="modal__body">{children}</div></section></div>
+  return (
+    <>
+      <div className="layer layer--modal" onClick={onClose} />
+      <div className={`modal ${wide ? 'modal--wide' : ''}`} role="dialog" aria-modal="true" ref={ref}>
+        <div className="modal__head">
+          <h2>{title}</h2>
+          <span className="spacer" />
+          <button className="icon-btn" aria-label="Close" onClick={onClose}>
+            <I.close size={16} />
+          </button>
+        </div>
+        <div className="modal__body">{children}</div>
+        {footer && <div className="modal__foot">{footer}</div>}
+      </div>
+    </>
+  )
 }
-const ToastContext = createContext<(message: string) => void>(() => {})
+
+export function SidePanel({ head, footer, onClose, children }: { head: ReactNode; footer?: ReactNode; onClose: () => void; children: ReactNode }) {
+  useEscape(onClose)
+  return (
+    <>
+      <div className="layer" onClick={onClose} />
+      <aside className="panel-side" role="dialog" aria-modal="true">
+        <div className="panel-side__head">
+          <div style={{ flex: 1, minWidth: 0 }}>{head}</div>
+          <button className="icon-btn" aria-label="Close" onClick={onClose}>
+            <I.close size={16} />
+          </button>
+        </div>
+        <div className="panel-side__body">{children}</div>
+        {footer && <div className="panel-side__foot">{footer}</div>}
+      </aside>
+    </>
+  )
+}
+
+type Toast = (message: string) => void
+const ToastContext = createContext<Toast>(() => undefined)
+
 export function ToastProvider({ children }: { children: ReactNode }) {
-  const [message, setMessage] = useState('')
-  useEffect(() => { if (!message) return; const timer = setTimeout(() => setMessage(''), 4500); return () => clearTimeout(timer) }, [message])
-  return <ToastContext.Provider value={setMessage}>{children}{message && <div className="toast" role="status"><Icon name="check"/>{message}</div>}</ToastContext.Provider>
+  const [message, setMessage] = useState<{ text: string; id: number } | null>(null)
+  const show = useCallback<Toast>((text) => {
+    const id = Date.now()
+    setMessage({ text, id })
+    setTimeout(() => setMessage((m) => (m?.id === id ? null : m)), 3200)
+  }, [])
+  return (
+    <ToastContext.Provider value={show}>
+      {children}
+      {message && (
+        <div className="toast" role="status">
+          <I.checkCircle size={16} />
+          {message.text}
+        </div>
+      )}
+    </ToastContext.Provider>
+  )
 }
+
 export const useToast = () => useContext(ToastContext)
+
+/** Run an async action with busy/error state. */
+export function useAction() {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const run = useCallback(async (work: () => Promise<unknown>) => {
+    setBusy(true)
+    setError(null)
+    try {
+      await work()
+      return true
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+  return { busy, error, setError, run }
+}

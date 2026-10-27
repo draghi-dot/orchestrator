@@ -68,25 +68,25 @@ export function settleClaim(evidence: EvidenceOutcome, stances: Stance[]): { sta
   const disputed = stances.includes('dispute')
   switch (evidence) {
     case 'not_reproduced':
-      return { status: 'rejected', reason: 'The host re-ran the reproduction and the app behaved correctly.' }
+      return { status: 'rejected', reason: 'Baton replayed the steps and the app behaved correctly.' }
     case 'code_missing':
       return { status: 'rejected', reason: 'The quoted code is not at the cited location.' }
     case 'reproduced':
-      if (agreed) return { status: 'confirmed', reason: 'The host reproduced it and the challenger agreed.' }
+      if (agreed) return { status: 'confirmed', reason: 'Baton reproduced it and the review agent agreed.' }
       return {
         status: 'needs_review',
-        reason: disputed ? 'The host reproduced it, but the challenger disputes that it is a defect.' : 'The host reproduced it; the challenger was not sure it is a defect.',
+        reason: disputed ? 'Baton reproduced it, but the review agent disputes that it is a bug.' : 'Baton reproduced it, but the review agent was not sure it is a bug.',
       }
     case 'code_verified':
-      if (agreed) return { status: 'confirmed', reason: 'The cited code exists as quoted and the challenger agreed.' }
+      if (agreed) return { status: 'confirmed', reason: 'The quoted code is where the finding says, and the review agent agreed.' }
       return {
         status: 'needs_review',
-        reason: disputed ? 'The cited code exists, but the challenger disputes the conclusion.' : 'The cited code exists; the challenger was not sure.',
+        reason: disputed ? 'The quoted code is real, but the review agent disputes the conclusion.' : 'The quoted code is real, but the review agent was not sure.',
       }
     case 'error':
-      return { status: 'inconclusive', reason: 'The host could not complete the check.' }
+      return { status: 'inconclusive', reason: 'Baton could not complete the check.' }
     case 'no_evidence':
-      return { status: 'inconclusive', reason: disputed ? 'No reproduction or code quote, and the challenger disputes it.' : 'No reproduction or code quote the host can check.' }
+      return { status: 'inconclusive', reason: disputed ? 'No steps or code to check, and the review agent disputes it.' : 'No steps or code that Baton can check.' }
   }
 }
 
