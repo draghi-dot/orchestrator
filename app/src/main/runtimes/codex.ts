@@ -39,6 +39,8 @@ export function codexArgs(a: Assignment, ctx: RuntimeContext, prefix: string[] =
     `mcp_servers.qa.args=${tomlArray(ctx.bridge.args)}`,
     `mcp_servers.qa.env=${tomlTable(ctx.bridge.env)}`,
     'mcp_servers.qa.required=true',
+    // Without this, codex exec refuses every MCP call under approval_policy="never".
+    'mcp_servers.qa.default_tools_approval_mode="approve"',
     'mcp_servers.qa.startup_timeout_sec=30',
     'mcp_servers.qa.tool_timeout_sec=900',
   ]
@@ -75,6 +77,9 @@ export class CodexRuntime implements AgentRuntime {
       let malformed = 0
       let lastError: string | null = null
       let result: Outcome | null = null
+      let toolCalls = 0
+      let failedToolCalls = 0
+      let lastToolError: string | null = null
 
       const child = spawn(this.options.command, codexArgs(a, ctx, this.options.argsPrefix), {
         cwd: ctx.scratchDir,
@@ -119,6 +124,14 @@ export class CodexRuntime implements AgentRuntime {
           case 'item.completed':
             if (item?.type === 'agent_message' && typeof item.text === 'string' && item.text.trim()) ctx.tools.recordAgentMessage(item.text)
             if (item?.type === 'error' && typeof item.message === 'string') lastError = item.message
+            if (item?.type === 'mcp_tool_call') {
+              toolCalls += 1
+              if (item.status === 'failed') {
+                failedToolCalls += 1
+                const err = item.error as Frame | null | undefined
+                lastToolError = typeof err?.message === 'string' ? err.message : 'tool call failed'
+              }
+            }
             break
           case 'error':
             lastError = typeof frame.message === 'string' ? frame.message : JSON.stringify(frame)
@@ -130,7 +143,12 @@ export class CodexRuntime implements AgentRuntime {
           }
           case 'turn.completed': {
             const usage = frame.usage && typeof frame.usage === 'object' ? (frame.usage as Record<string, unknown>) : undefined
-            result = ctx.tools.blockedReason ? { kind: 'blocked', reason: ctx.tools.blockedReason, usage } : { kind: 'finished', reason: 'worker finished', usage }
+            if (toolCalls > 0 && failedToolCalls === toolCalls) {
+              // Every action was refused before it reached Baton: the worker did nothing.
+              result = { kind: 'error', reason: `Codex could not use the QA tools: ${bounded(lastToolError ?? 'every tool call failed', 300)}`, usage }
+            } else {
+              result = ctx.tools.blockedReason ? { kind: 'blocked', reason: ctx.tools.blockedReason, usage } : { kind: 'finished', reason: 'worker finished', usage }
+            }
             break
           }
           default:

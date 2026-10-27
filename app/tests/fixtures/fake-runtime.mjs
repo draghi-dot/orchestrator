@@ -23,6 +23,7 @@ else if (kind === 'omp') {
       emit({ type: 'system', subtype: 'init', mcp_servers: [{ name: 'qa', status: scenario === 'bridge-error' ? 'failed' : 'connected' }] })
       emit({ type: 'result', subtype: scenario === 'failure' ? 'error' : 'success', is_error: scenario === 'failure', result: 'fixture result' })
     } else {
+      if (scenario === 'tools-refused') emit({ type: 'item.completed', item: { type: 'mcp_tool_call', server: 'qa', tool: 'note', status: 'failed', error: { message: 'MCP tool call requires approval, but approval policy is never' } } })
       emit({ type: 'item.completed', item: { type: 'agent_message', text: 'Fixture worker finished.' } })
       emit(scenario === 'failure' ? { type: 'turn.failed', error: { message: 'fixture failure' } } : { type: 'turn.completed', usage: { input_tokens: 1 } })
     }

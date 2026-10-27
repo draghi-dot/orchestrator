@@ -38,6 +38,16 @@ describe('runtime protocol boundaries', () => {
       expect((await new Runtime(options(name, scenario)).execute(a, ctx)).kind).toBe('error')
     })
   }
+  it('Codex reports an error when every QA tool call was refused', async () => {
+    const { a, ctx } = await context()
+    const outcome = await new CodexRuntime(options('codex', 'tools-refused')).execute(a, ctx)
+    expect(outcome.kind).toBe('error')
+    expect(outcome.reason).toContain('could not use the QA tools')
+  })
+  it('lets Codex call QA tools without an approval prompt', async () => {
+    const { a, ctx } = await context()
+    expect(codexArgs(a, ctx)).toContain('mcp_servers.qa.default_tools_approval_mode="approve"')
+  })
   it('Claude refuses a disconnected QA tool bridge', async () => {
     const { a, ctx } = await context()
     expect((await new ClaudeRuntime(options('claude', 'bridge-error')).execute(a, ctx)).kind).toBe('error')
